@@ -11,9 +11,6 @@ import csv
 from io import StringIO, BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet
 
 @csrf_exempt
 @require_POST
@@ -27,7 +24,7 @@ def calculate(request):
         mu = float(data.get('mu', 0.45))
         sigma = float(data.get('sigma', 0.55))
         t = float(data.get('t', 1))
-        delta = float(data.get('delta', 0.08))
+        delta = float(data.get('delta', 0.08))  # Used as yield and credit spread
         S_0 = float(data.get('S_0', 1000000))
         delta_S = float(data.get('delta_S', 50000))
         IssuePrice = float(data.get('IssuePrice', 117000))
@@ -41,53 +38,71 @@ def calculate(request):
         kappa = float(data.get('kappa', 0.5))
         theta = float(data.get('theta', 0.5))
         paths = int(data.get('paths', 10000))
+        # Merton jump parameters
+        lambda_j = float(data.get('lambda_j', 0.1))  # Jump intensity
+        mu_j = float(data.get('mu_j', 0.0))         # Jump mean
+        sigma_j = float(data.get('sigma_j', 0.2))   # Jump std
         export_format = data.get('format', 'json').lower()
         use_live = data.get('use_live', False)
+
+        # Input validation
+        if theta == 0:
+            raise ValueError("theta cannot be zero to avoid division by zero")
+        if S_0 <= 0 or BTC_t <= 0:
+            raise ValueError("S_0 and BTC_t must be positive")
 
         # Use live BTC price
         if use_live:
             try:
                 response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd')
                 BTC_t = response.json()['bitcoin']['usd']
-            except:
-                pass
+            except Exception as e:
+                print(f"Live BTC price fetch failed: {str(e)}")
 
-        # Simulate BTC paths
+        # Simulate BTC paths with Merton jump diffusion and Heston/GARCH volatility
         dt = t / paths
-        mu_bayes = 0.5 * mu + 0.5 * 0.4
-        btc_returns = np.random.normal(loc=mu_bayes * dt, scale=sigma * np.sqrt(dt), size=paths)
-        btc_prices = BTC_0 * np.exp(np.cumsum(btc_returns))
+        mu_bayes = 0.5 * mu + 0.5 * 0.4  # Bayesian drift update
+        mu_adj = mu_bayes - lambda_j * (np.exp(mu_j + 0.5 * sigma_j**2) - 1)  # Jump-adjusted drift
 
-        # GARCH volatility
-        log_returns = np.log(btc_prices[1:] / btc_prices[:-1]) * 100
+        # Initial BTC path to compute GARCH volatility
+        btc_returns_init = np.random.normal(loc=mu_adj * dt, scale=sigma * np.sqrt(dt), size=paths)
+        btc_prices_init = BTC_0 * np.exp(np.cumsum(btc_returns_init))
+        log_returns = np.log(btc_prices_init[1:] / btc_prices_init[:-1]) * 100
         garch_model = arch_model(log_returns, p=1, q=1)
         garch_fit = garch_model.fit(disp='off')
         vol_garch = garch_fit.conditional_volatility / 100
-
-        # Heston volatility
         vol_heston = theta + (sigma - theta) * np.exp(-kappa * np.linspace(0, t, len(vol_garch))) + vol_garch
 
-        # NAV
+        # Simulate final BTC paths using vol_heston
+        btc_returns = np.zeros(paths)
+        for i in range(paths):
+            btc_returns[i] = np.random.normal(loc=mu_adj * dt, scale=vol_heston[min(i, len(vol_heston)-1)] * np.sqrt(dt))
+            if np.random.random() < lambda_j * dt:  # Merton jump
+                btc_returns[i] += np.random.normal(mu_j, sigma_j)
+        btc_prices = BTC_0 * np.exp(np.cumsum(btc_returns))
+
+        # NAV with dilution drag
         final_btc_price = btc_prices[-1]
         CollateralValue_t = BTC_0 * final_btc_price
-        NAV = (CollateralValue_t + CollateralValue_t * delta - LoanPrincipal * C_Debt) / (S_0 + delta_S)
-        nav_paths = [(BTC_0 * p + BTC_0 * p * delta - LoanPrincipal * C_Debt) / (S_0 + delta_S) for p in btc_prices]
+        base_dilution = delta_S / (S_0 + delta_S)
+        nav_paths_temp = [(BTC_0 * p + BTC_0 * p * delta - LoanPrincipal * C_Debt) / (S_0 + delta_S) for p in btc_prices]
+        dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * IssuePrice, nav, vol_fixed * np.sqrt(t)))
+                          for nav in nav_paths_temp]
+        avg_dilution = np.mean(dilution_paths)
+        nav_paths = [nav - avg_dilution for nav in nav_paths_temp]
+        NAV = (CollateralValue_t + CollateralValue_t * delta - LoanPrincipal * C_Debt - avg_dilution) / (S_0 + delta_S)
         avg_nav = np.mean(nav_paths)
         ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(paths)
         erosion_prob = np.mean(np.array(nav_paths) < 0.9 * avg_nav)
 
         # Dilution
-        base_dilution = delta_S / (S_0 + delta_S)
-        dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * IssuePrice, nav, vol_fixed * np.sqrt(t)))
-                          for nav in nav_paths]
-        avg_dilution = np.mean(dilution_paths)
         ci_dilution = 1.96 * np.std(dilution_paths) / np.sqrt(paths)
 
         # Convertible value
         S = final_btc_price * BTC_0
-        d1 = (np.log(S / IssuePrice) + (r_f + 0.5 * vol_heston[-1] ** 2) * t) / (vol_heston[-1] * np.sqrt(t))
+        d1 = (np.log(S / IssuePrice) + (r_f + delta + 0.5 * vol_heston[-1] ** 2) * t) / (vol_heston[-1] * np.sqrt(t))
         d2 = d1 - vol_heston[-1] * np.sqrt(t)
-        convertible_value = S * norm.cdf(d1) - IssuePrice * np.exp(-r_f * t) * norm.cdf(d2)
+        convertible_value = S * norm.cdf(d1) - IssuePrice * np.exp(-(r_f + delta) * t) * norm.cdf(d2)
 
         # LTV
         ltv = LoanPrincipal / CollateralValue_t
@@ -107,13 +122,13 @@ def calculate(request):
         bundle_value = (0.4 * avg_nav + 0.3 * avg_dilution + 0.3 * convertible_value) * (1 - tax_rate)
 
         # Term Sheet & Business Impact
-        optimized_ltv = 0.5
+        optimized_ltv = 0.5 if exceed_prob < 0.15 else LTV_Cap
         optimized_rate = r_f + 0.02 * (sigma / theta)
         optimized_amount = CollateralValue_t * optimized_ltv
         optimized_btc = optimized_amount / BTC_t
-        adjusted_savings = (base_dilution * delta_S * BTC_t) - avg_dilution
+        adjusted_savings = (base_dilution * S_0 * BTC_t) - avg_dilution
         roe_uplift = avg_roe - (E_R_BTC * beta_ROE)
-        kept_money = adjusted_savings + roe_uplift * delta_S * BTC_t
+        kept_money = adjusted_savings + roe_uplift * S_0 * BTC_t
 
         term_sheet = {
             'structure': 'Convertible Note' if avg_dilution < 0.1 else 'BTC-Collateralized Loan',
@@ -201,7 +216,7 @@ def calculate(request):
             buffer = BytesIO()
             c = canvas.Canvas(buffer, pagesize=letter)
             c.setFont("Helvetica", 12)
-            y = 750  # Start position
+            y = 750
             c.drawString(100, y, "Financial Metrics Report")
             y -= 30
             c.drawString(100, y, f"Average NAV: {avg_nav:.2f}")
@@ -230,7 +245,7 @@ def calculate(request):
             response.write(pdf)
             return response
 
-        else:  # Default to JSON
+        else:
             return JsonResponse(response_data)
 
     except Exception as e:
@@ -240,7 +255,7 @@ def calculate(request):
             return HttpResponse(f"Error: {str(e)}", content_type='text/plain', status=400)
         else:
             return JsonResponse({'error': str(e)}, status=400)
-        
+
 @csrf_exempt
 @require_POST
 def what_if(request):
@@ -272,42 +287,52 @@ def what_if(request):
         kappa = float(assumptions.get('kappa', 0.5))
         theta = float(assumptions.get('theta', 0.5))
         paths = int(assumptions.get('paths', 10000))
+        lambda_j = float(assumptions.get('lambda_j', 0.1))
+        mu_j = float(assumptions.get('mu_j', 0.0))
+        sigma_j = float(assumptions.get('sigma_j', 0.2))
+
+        # Input validation
+        if theta == 0:
+            raise ValueError("theta cannot be zero to avoid division by zero")
+        if S_0 <= 0 or BTC_t <= 0:
+            raise ValueError("S_0 and BTC_t must be positive")
 
         # Use live BTC price
         if use_live:
             try:
                 response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd')
                 BTC_t = response.json()['bitcoin']['usd']
-            except:
-                pass
+            except Exception as e:
+                print(f"Live BTC price fetch failed: {str(e)}")
         CollateralValue_t = BTC_0 * BTC_t
 
-        # Optimization logic for LTV_Cap
+        # Optimization logic
         dt = t / paths
-        jumps = levy_stable.rvs(alpha=1.5, beta=0, size=paths) * 0.15 * dt
         if param == 'LTV_Cap' and value == 'optimize':
             best_ltv = 0.5
             min_prob = 1.0
             for ltv in np.arange(0.1, 0.9, 0.05):
                 assumptions['LTV_Cap'] = ltv
+                jumps = levy_stable.rvs(alpha=1.5, beta=0, size=paths) * 0.15 * dt
                 ltv_t = LoanPrincipal / (CollateralValue_t * np.cumprod(1 + np.random.normal(mu, sigma, paths) * dt - 0.01 * jumps))
                 prob = np.mean(ltv_t > ltv)
                 if prob < min_prob:
                     min_prob = prob
                     best_ltv = ltv
-            value = best_ltv
+            optimized_ltv = 0.5 if min_prob < 0.15 else best_ltv
         elif param == 'beta_ROE' and value == 'maximize':
             best_beta = 2.5
             max_roe = 0.0
             for beta in np.arange(1.0, 3.0, 0.1):
                 assumptions['beta_ROE'] = beta
-                roe_t = r_f + beta * (E_R_BTC - r_f) * (1 + sigma / theta)
+                roe_t = r_f + beta * (E_R_BTC - r_f) * (1 + vol_heston / theta)
                 if np.mean(roe_t) > max_roe:
                     max_roe = np.mean(roe_t)
                     best_beta = beta
             value = best_beta
         else:
             assumptions[param] = value
+            optimized_ltv = 0.5 if exceed_prob < 0.15 else LTV_Cap
 
         # Update assumptions
         BTC_0 = float(assumptions.get('BTC_0', 1000))
@@ -322,79 +347,83 @@ def what_if(request):
         LoanPrincipal = float(assumptions.get('LoanPrincipal', 50000000))
         C_Debt = float(assumptions.get('C_Debt', 0.06))
         vol_fixed = float(assumptions.get('vol_fixed', 0.55))
-        LTV_Cap = float(assumptions.get('LTV_Cap', 0.5))
-        beta_ROE = float(assumptions.get('beta_ROE', 2.5))
+        LTV_Cap = float(assumptions.get('LTV_Cap', value if param == 'LTV_Cap' else 0.5))
+        beta_ROE = float(assumptions.get('beta_ROE', value if param == 'beta_ROE' else 2.5))
         E_R_BTC = float(assumptions.get('E_R_BTC', 0.45))
         r_f = float(assumptions.get('r_f', 0.04))
         kappa = float(assumptions.get('kappa', 0.5))
         theta = float(assumptions.get('theta', 0.5))
         paths = int(assumptions.get('paths', 10000))
-        CollateralValue_t = BTC_0 * BTC_t
+        lambda_j = float(assumptions.get('lambda_j', 0.1))
+        mu_j = float(assumptions.get('mu_j', 0.0))
+        sigma_j = float(assumptions.get('sigma_j', 0.2))
 
-        # Simulate BTC paths (aligned with calculate)
+        # Simulate BTC paths with Merton jump diffusion
         dt = t / paths
         mu_bayes = 0.5 * mu + 0.5 * 0.4
-        btc_returns = np.random.normal(loc=mu_bayes * dt, scale=sigma * np.sqrt(dt), size=paths)
-        btc_prices = BTC_0 * np.exp(np.cumsum(btc_returns))
-
-        # GARCH volatility (aligned with calculate)
-        log_returns = np.log(btc_prices[1:] / btc_prices[:-1]) * 100
+        mu_adj = mu_bayes - lambda_j * (np.exp(mu_j + 0.5 * sigma_j**2) - 1)
+        btc_returns_init = np.random.normal(loc=mu_adj * dt, scale=sigma * np.sqrt(dt), size=paths)
+        btc_prices_init = BTC_0 * np.exp(np.cumsum(btc_returns_init))
+        log_returns = np.log(btc_prices_init[1:] / btc_prices_init[:-1]) * 100
         garch_model = arch_model(log_returns, p=1, q=1)
         garch_fit = garch_model.fit(disp='off')
         vol_garch = garch_fit.conditional_volatility / 100
-
-        # Heston volatility (aligned with calculate)
         vol_heston = theta + (sigma - theta) * np.exp(-kappa * np.linspace(0, t, len(vol_garch))) + vol_garch
+        btc_returns = np.zeros(paths)
+        for i in range(paths):
+            btc_returns[i] = np.random.normal(loc=mu_adj * dt, scale=vol_heston[min(i, len(vol_heston)-1)] * np.sqrt(dt))
+            if np.random.random() < lambda_j * dt:
+                btc_returns[i] += np.random.normal(mu_j, sigma_j)
+        btc_prices = BTC_0 * np.exp(np.cumsum(btc_returns))
 
-        # NAV (aligned with calculate)
+        # NAV with dilution drag
         final_btc_price = btc_prices[-1]
         CollateralValue_t = BTC_0 * final_btc_price
-        NAV = (CollateralValue_t + CollateralValue_t * delta - LoanPrincipal * C_Debt) / (S_0 + delta_S)
-        nav_paths = [(BTC_0 * p + BTC_0 * p * delta - LoanPrincipal * C_Debt) / (S_0 + delta_S) for p in btc_prices]
+        base_dilution = delta_S / (S_0 + delta_S)
+        nav_paths_temp = [(BTC_0 * p + BTC_0 * p * delta - LoanPrincipal * C_Debt) / (S_0 + delta_S) for p in btc_prices]
+        dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * IssuePrice, nav, vol_fixed * np.sqrt(t)))
+                          for nav in nav_paths_temp]
+        avg_dilution = np.mean(dilution_paths)
+        nav_paths = [nav - avg_dilution for nav in nav_paths_temp]
+        NAV = (CollateralValue_t + CollateralValue_t * delta - LoanPrincipal * C_Debt - avg_dilution) / (S_0 + delta_S)
         avg_nav = np.mean(nav_paths)
         ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(paths)
         erosion_prob = np.mean(np.array(nav_paths) < 0.9 * avg_nav)
 
-        # Dilution (aligned with calculate)
-        base_dilution = delta_S / (S_0 + delta_S)
-        dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * IssuePrice, nav, vol_fixed * np.sqrt(t)))
-                          for nav in nav_paths]
-        avg_dilution = np.mean(dilution_paths)
+        # Dilution
         ci_dilution = 1.96 * np.std(dilution_paths) / np.sqrt(paths)
 
-        # Convertible value (aligned with calculate, removing C_Debt for consistency)
+        # Convertible value
         S = final_btc_price * BTC_0
-        d1 = (np.log(S / IssuePrice) + (r_f + 0.5 * vol_heston[-1] ** 2) * t) / (vol_heston[-1] * np.sqrt(t))
+        d1 = (np.log(S / IssuePrice) + (r_f + delta + 0.5 * vol_heston[-1] ** 2) * t) / (vol_heston[-1] * np.sqrt(t))
         d2 = d1 - vol_heston[-1] * np.sqrt(t)
-        convertible_value = S * norm.cdf(d1) - IssuePrice * np.exp(-r_f * t) * norm.cdf(d2)
-        avg_convertible = np.mean(convertible_value)
-        ci_convertible = 1.96 * np.std(convertible_value) / np.sqrt(paths)
+        convertible_value = S * norm.cdf(d1) - IssuePrice * np.exp(-(r_f + delta) * t) * norm.cdf(d2)
 
-        # LTV (aligned with calculate)
+        # LTV
         ltv = LoanPrincipal / CollateralValue_t
         ltv_paths = [LoanPrincipal / (BTC_0 * p) for p in btc_prices]
         avg_ltv = np.mean(ltv_paths)
         ci_ltv = 1.96 * np.std(ltv_paths) / np.sqrt(paths)
         exceed_prob = np.mean(np.array(ltv_paths) > LTV_Cap)
 
-        # ROE (aligned with calculate)
+        # ROE
         roe_t = r_f + beta_ROE * (E_R_BTC - r_f) * (1 + vol_heston / theta)
         avg_roe = np.mean(roe_t)
         ci_roe = 1.96 * np.std(roe_t) / np.sqrt(paths)
         sharpe = (avg_roe - r_f) / np.std(roe_t)
 
-        # Preferred bundle (aligned with calculate)
+        # Preferred bundle
         tax_rate = 0.2
-        bundle_value = (0.4 * avg_nav + 0.3 * avg_dilution + 0.3 * avg_convertible) * (1 - tax_rate)
+        bundle_value = (0.4 * avg_nav + 0.3 * avg_dilution + 0.3 * convertible_value) * (1 - tax_rate)
 
-        # Term Sheet & Business Impact (aligned with calculate)
-        optimized_ltv = LTV_Cap
+        # Term Sheet & Business Impact
+        optimized_ltv = 0.5 if exceed_prob < 0.15 else LTV_Cap
         optimized_rate = r_f + 0.02 * (sigma / theta)
         optimized_amount = CollateralValue_t * optimized_ltv
         optimized_btc = optimized_amount / BTC_t
-        adjusted_savings = (base_dilution * delta_S * BTC_t) - avg_dilution
+        adjusted_savings = (base_dilution * S_0 * BTC_t) - avg_dilution
         roe_uplift = avg_roe - (E_R_BTC * beta_ROE)
-        kept_money = adjusted_savings + roe_uplift * delta_S * BTC_t
+        kept_money = adjusted_savings + roe_uplift * S_0 * BTC_t
 
         term_sheet = {
             'structure': 'Convertible Note' if avg_dilution < 0.1 else 'BTC-Collateralized Loan',
@@ -432,9 +461,9 @@ def what_if(request):
                 'ci_upper': avg_dilution + ci_dilution
             },
             'convertible': {
-                'avg_convertible': avg_convertible,
-                'ci_lower': avg_convertible - ci_convertible,
-                'ci_upper': avg_convertible + ci_convertible
+                'avg_convertible': convertible_value,
+                'ci_lower': convertible_value,
+                'ci_upper': convertible_value
             },
             'ltv': {
                 'avg_ltv': avg_ltv,
@@ -458,7 +487,7 @@ def what_if(request):
             'business_impact': business_impact
         }
 
-        # Handle export format (aligned with calculate)
+        # Handle export format
         if export_format == 'csv':
             output = StringIO()
             writer = csv.writer(output)
