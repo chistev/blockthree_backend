@@ -80,10 +80,12 @@ def calculate_metrics(params, btc_prices, vol_heston):
     
     # Convertible value
     S = final_btc_price * params['BTC_0']
+    if vol_heston[-1] == 0:
+        raise ZeroDivisionError("Volatility (vol_heston[-1]) cannot be zero in Black-Scholes calculation")
     d1 = (np.log(S / params['IssuePrice']) + (params['r_f'] + params['delta'] + 0.5 * vol_heston[-1] ** 2) * params['t']) / (vol_heston[-1] * np.sqrt(params['t']))
     d2 = d1 - vol_heston[-1] * np.sqrt(params['t'])
     convertible_value = S * norm.cdf(d1) - params['IssuePrice'] * np.exp(-(params['r_f'] + params['delta']) * params['t']) * norm.cdf(d2)
-    
+        
     # LTV
     ltv_paths = [params['LoanPrincipal'] / (params['BTC_0'] * p) for p in btc_prices]
     avg_ltv = np.mean(ltv_paths)
