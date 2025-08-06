@@ -94,7 +94,7 @@ def calculate(request):
 
         # LTV_Risk (Path-Dependent VaR-EVT)
         jumps = levy_stable.rvs(alpha=1.5, beta=0, size=paths) * 0.15 * dt
-        ltv_t = LoanPrincipal / (CollateralValue_t * np.cumprod(1 + np.random.normal(mu, sigma, paths) * dt - 0.01 * jumps)) * (BTC_t / 117000)
+        ltv_t = LoanPrincipal / (CollateralValue_t * np.cumprod(1 + np.random.normal(mu, sigma, paths) * dt - 0.01 * jumps))
         avg_ltv = np.mean(ltv_t)
         ci_ltv_lower = avg_ltv - 1.96 * np.std(ltv_t) / np.sqrt(paths)
         ci_ltv_upper = avg_ltv + 1.96 * np.std(ltv_t) / np.sqrt(paths)
@@ -282,36 +282,6 @@ def what_if(request):
         assumptions = data.get('assumptions', {})
         export_format = data.get('format', 'json')  # Default to JSON
 
-        # Optimization logic for LTV_Cap
-        if param == 'LTV_Cap' and value == 'optimize':
-            best_ltv = 0.5
-            min_prob = 1.0
-            for ltv in np.arange(0.1, 0.9, 0.05):
-                assumptions['LTV_Cap'] = ltv
-                ltv_t = (assumptions.get('LoanPrincipal', 50000000) /
-                         (assumptions.get('BTC_0', 1000) * assumptions.get('BTC_t', 117000)) *
-                         (assumptions.get('BTC_t', 117000) / 117000))
-                prob = np.mean(ltv_t > ltv)
-                if prob < min_prob:
-                    min_prob = prob
-                    best_ltv = ltv
-            value = best_ltv
-        # Optimization logic for beta_ROE
-        elif param == 'beta_ROE' and value == 'maximize':
-            best_beta = 2.5
-            max_roe = 0.0
-            for beta in np.arange(1.0, 3.0, 0.1):
-                assumptions['beta_ROE'] = beta
-                roe_t = (assumptions.get('r_f', 0.04) +
-                         beta * (assumptions.get('E_R_BTC', 0.45) - assumptions.get('r_f', 0.04)) *
-                         (1 + assumptions.get('sigma', 0.55) / assumptions.get('theta', 0.5)))
-                if np.mean(roe_t) > max_roe:
-                    max_roe = np.mean(roe_t)
-                    best_beta = beta
-            value = best_beta
-        else:
-            assumptions[param] = value
-
         # Extract or set default assumptions
         BTC_0 = float(assumptions.get('BTC_0', 1000))
         BTC_t = float(assumptions.get('BTC_t', 117000))
@@ -334,13 +304,72 @@ def what_if(request):
         theta = float(assumptions.get('theta', 0.5))
         paths = int(assumptions.get('paths', 10000))
 
-        # Calculations
+        # Optional: Fetch live BTC price if use_live is true
+        if data.get('use_live', False):
+            try:
+                live_response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd')
+                BTC_t = live_response.json()['bitcoin']['usd']
+                CollateralValue_t = BTC_0 * BTC_t
+            except:
+                pass
+
+        # Optimization logic for LTV_Cap
+        dt = t / paths
+        jumps = levy_stable.rvs(alpha=1.5, beta=0, size=paths) * 0.15 * dt
+        if param == 'LTV_Cap' and value == 'optimize':
+            best_ltv = 0.5
+            min_prob = 1.0
+            for ltv in np.arange(0.1, 0.9, 0.05):
+                assumptions['LTV_Cap'] = ltv
+                ltv_t = LoanPrincipal / (CollateralValue_t * np.cumprod(1 + np.random.normal(mu, sigma, paths) * dt - 0.01 * jumps))
+                prob = np.mean(ltv_t > ltv)
+                if prob < min_prob:
+                    min_prob = prob
+                    best_ltv = ltv
+            value = best_ltv
+        # Optimization logic for beta_ROE
+        elif param == 'beta_ROE' and value == 'maximize':
+            best_beta = 2.5
+            max_roe = 0.0
+            for beta in np.arange(1.0, 3.0, 0.1):
+                assumptions['beta_ROE'] = beta
+                roe_t = (assumptions.get('r_f', 0.04) +
+                         beta * (assumptions.get('E_R_BTC', 0.45) - assumptions.get('r_f', 0.04)) *
+                         (1 + assumptions.get('sigma', 0.55) / assumptions.get('theta', 0.5)))
+                if np.mean(roe_t) > max_roe:
+                    max_roe = np.mean(roe_t)
+                    best_beta = beta
+            value = best_beta
+        else:
+            assumptions[param] = value
+
+        # Update assumptions after optimization
+        BTC_0 = float(assumptions.get('BTC_0', 1000))
+        BTC_t = float(assumptions.get('BTC_t', BTC_t))  # Use updated BTC_t if live data was fetched
+        mu = float(assumptions.get('mu', 0.45))
+        sigma = float(assumptions.get('sigma', 0.55))
+        t = float(assumptions.get('t', 1))
+        delta = float(assumptions.get('delta', 0.08))
+        S_0 = float(assumptions.get('S_0', 1000000))
+        delta_S = float(assumptions.get('delta_S', 50000))
+        IssuePrice = float(assumptions.get('IssuePrice', 117000))
+        LoanPrincipal = float(assumptions.get('LoanPrincipal', 50000000))
+        CollateralValue_t = BTC_0 * BTC_t
+        C_Debt = float(assumptions.get('C_Debt', 0.06))
+        vol_fixed = float(assumptions.get('vol_fixed', 0.55))
+        LTV_Cap = float(assumptions.get('LTV_Cap', 0.5))
+        beta_ROE = float(assumptions.get('beta_ROE', 2.5))
+        E_R_BTC = float(assumptions.get('E_R_BTC', 0.45))
+        r_f = float(assumptions.get('r_f', 0.04))
+        kappa = float(assumptions.get('kappa', 0.5))
+        theta = float(assumptions.get('theta', 0.5))
+        paths = int(assumptions.get('paths', 10000))
+
         # Calculations
         dt = t / paths
         vol_heston = theta + (sigma - theta) * np.exp(-kappa * np.linspace(0, t, paths)) + sigma * np.random.normal(0, np.sqrt(dt), paths)
         jumps = levy_stable.rvs(alpha=1.5, beta=0, size=paths) * 0.15 * dt
         btc_paths = BTC_0 * np.exp((mu - 0.5 * vol_heston**2) * dt + vol_heston * np.random.normal(0, np.sqrt(dt), paths) + jumps)
-        # Rescale returns for GARCH (not explicitly fitted here, but align with calculate view for consistency)
         nav_t = (btc_paths * BTC_t + CollateralValue_t * delta - LoanPrincipal * C_Debt - delta_S * LoanPrincipal * 0.05) / (S_0 + delta_S)
         avg_nav = np.mean(nav_t)
         ci_nav_lower = avg_nav - 1.96 * np.std(nav_t) / np.sqrt(paths)
@@ -361,7 +390,7 @@ def what_if(request):
         ci_convertible_lower = avg_convertible - 1.96 * np.std(convertible_value) / np.sqrt(paths)
         ci_convertible_upper = avg_convertible + 1.96 * np.std(convertible_value) / np.sqrt(paths)
 
-        ltv_t = LoanPrincipal / CollateralValue_t * (BTC_t / 117000)
+        ltv_t = LoanPrincipal / (CollateralValue_t * np.cumprod(1 + np.random.normal(mu, sigma, paths) * dt - 0.01 * jumps))  # Use simulated ltv_t
         avg_ltv = np.mean(ltv_t)
         ci_ltv_lower = avg_ltv - 1.96 * np.std(ltv_t) / np.sqrt(paths)
         ci_ltv_upper = avg_ltv + 1.96 * np.std(ltv_t) / np.sqrt(paths)
@@ -448,7 +477,6 @@ def what_if(request):
 
         # Handle export format
         if export_format.lower() == 'csv':
-            # Create a DataFrame for CSV export
             df = pd.DataFrame({
                 'Metric': [
                     'Average NAV', 'NAV CI Lower', 'NAV CI Upper', 'NAV Erosion Probability',
@@ -477,13 +505,9 @@ def what_if(request):
                     business_impact['kept_money'], business_impact['roe_uplift'], business_impact['reduced_risk']
                 ]
             })
-
-            # Generate CSV
             output = StringIO()
             df.to_csv(output, index=False)
             output.seek(0)
-
-            # Create response
             response = HttpResponse(
                 content_type='text/csv',
                 headers={'Content-Disposition': 'attachment; filename="what_if_results.csv"'},
@@ -492,7 +516,6 @@ def what_if(request):
             return response
 
         elif export_format.lower() == 'pdf':
-            # Create a PDF
             buffer = BytesIO()
             p = canvas.Canvas(buffer, pagesize=letter)
             p.setFont("Helvetica", 12)
@@ -501,26 +524,21 @@ def what_if(request):
             y -= 20
             p.drawString(50, y, "-" * 50)
             y -= 20
-
-            # Add results to PDF
             for section, values in response_data.items():
                 p.drawString(50, y, f"{section.capitalize()}:")
                 y -= 20
                 for key, value in values.items():
                     if isinstance(value, list):
-                        value = f"List of {len(value)} values"  # Summarize lists for PDF
+                        value = f"List of {len(value)} values"
                     p.drawString(70, y, f"{key}: {value}")
                     y -= 20
                     if y < 50:
                         p.showPage()
                         y = 750
                 y -= 10
-
             p.showPage()
             p.save()
             buffer.seek(0)
-
-            # Create response
             response = HttpResponse(
                 content_type='application/pdf',
                 headers={'Content-Disposition': 'attachment; filename="what_if_results.pdf"'},
@@ -530,7 +548,6 @@ def what_if(request):
             return response
 
         else:
-            # Default JSON response
             return JsonResponse(response_data)
 
     except Exception as e:
