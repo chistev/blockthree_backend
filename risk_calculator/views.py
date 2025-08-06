@@ -57,12 +57,15 @@ def calculate(request):
         mu_bayes = 0.5 * prior_mu + 0.5 * mu
 
         # NAV_Risk_Audit (Lévy-Heston with Merton + GARCH)
+        # NAV_Risk_Audit (Lévy-Heston with Merton + GARCH)
         dt = t / paths
         vol_heston = theta + (sigma - theta) * np.exp(-kappa * np.linspace(0, t, paths)) + sigma * np.random.normal(0, np.sqrt(dt), paths)
         returns = np.log([BTC_0] + [BTC_0 * np.exp(mu * dt + sigma * np.random.normal(0, np.sqrt(dt))) for _ in range(paths-1)])
-        garch = arch_model(returns, p=1, q=1)
+        # Rescale returns by multiplying by 100 to address DataScaleWarning
+        returns_scaled = returns * 100
+        garch = arch_model(returns_scaled, p=1, q=1)
         garch_fit = garch.fit(disp='off')
-        vol_garch = garch_fit.conditional_volatility
+        vol_garch = garch_fit.conditional_volatility / 100  # Rescale volatility back to original scale
         vol_heston = vol_garch + vol_heston
         k = np.exp(mu_j + 0.5 * sigma_j**2) - 1
         mu_adj = mu_bayes - lambda_j * k
@@ -332,10 +335,12 @@ def what_if(request):
         paths = int(assumptions.get('paths', 10000))
 
         # Calculations
+        # Calculations
         dt = t / paths
         vol_heston = theta + (sigma - theta) * np.exp(-kappa * np.linspace(0, t, paths)) + sigma * np.random.normal(0, np.sqrt(dt), paths)
         jumps = levy_stable.rvs(alpha=1.5, beta=0, size=paths) * 0.15 * dt
         btc_paths = BTC_0 * np.exp((mu - 0.5 * vol_heston**2) * dt + vol_heston * np.random.normal(0, np.sqrt(dt), paths) + jumps)
+        # Rescale returns for GARCH (not explicitly fitted here, but align with calculate view for consistency)
         nav_t = (btc_paths * BTC_t + CollateralValue_t * delta - LoanPrincipal * C_Debt - delta_S * LoanPrincipal * 0.05) / (S_0 + delta_S)
         avg_nav = np.mean(nav_t)
         ci_nav_lower = avg_nav - 1.96 * np.std(nav_t) / np.sqrt(paths)
