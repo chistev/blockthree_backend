@@ -1,6 +1,8 @@
 import json
+import unittest
+from unittest.mock import patch, Mock
 from django.test import TestCase, RequestFactory
-from .views import get_json_data
+from .views import fetch_btc_price, get_json_data
 
 class TestGetJsonData(TestCase):
     def setUp(self):
@@ -31,3 +33,23 @@ class TestGetJsonData(TestCase):
         request = self.factory.post('/', data="not a json string", content_type='application/json')
         with self.assertRaises(json.JSONDecodeError):
             get_json_data(request)
+
+class TestFetchBTCPrice(unittest.TestCase):
+
+    @patch('risk_calculator.views.requests.get')
+    def test_fetch_btc_price_success(self, mock_get):
+        # Mock successful response
+        mock_response = Mock()
+        mock_response.json.return_value = {'bitcoin': {'usd': 68123.45}}
+        mock_get.return_value = mock_response
+
+        price = fetch_btc_price()
+        self.assertEqual(price, 68123.45)
+
+    @patch('risk_calculator.views.requests.get')
+    def test_fetch_btc_price_api_failure(self, mock_get):
+        # Simulate exception during API call
+        mock_get.side_effect = Exception("API down")
+
+        price = fetch_btc_price()
+        self.assertIsNone(price)
