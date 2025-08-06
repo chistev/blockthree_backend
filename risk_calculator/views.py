@@ -1,15 +1,18 @@
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt
 import numpy as np
 from scipy.stats import norm, levy_stable
 from arch import arch_model
 import pandas as pd
-import plotly.express as px  # Included to match Flask, though unused
 import requests
 import json
+import csv
+from io import StringIO, BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
-@csrf_exempt  # Disable CSRF for simplicity (use proper CSRF handling in production)
+@csrf_exempt
 @require_POST
 def calculate(request):
     try:
@@ -36,11 +39,12 @@ def calculate(request):
         kappa = float(data.get('kappa', 0.5))
         theta = float(data.get('theta', 0.5))
         paths = int(data.get('paths', 10000))
-        lambda_j = 0.5  # Jump intensity
-        mu_j = -0.2  # Mean jump size
-        sigma_j = 0.15  # Jump vol
-        tax_rate = 0.2  # Tax rate
-        prior_mu = 0.4  # Bayesian prior
+        lambda_j = 0.5
+        mu_j = -0.2
+        sigma_j = 0.15
+        tax_rate = 0.2
+        prior_mu = 0.4
+        export_format = data.get('format', 'json')  # Default to JSON
 
         # Live BTC data
         try:
@@ -106,7 +110,7 @@ def calculate(request):
         ci_bundle_upper = (0.4 * ci_nav_upper + 0.3 * ci_dilution_upper + 0.3 * ci_convertible_upper) * (1 - tax_rate)
 
         # Term Sheet & Business Impact
-        optimized_ltv = 0.5  # Optimized via simulation
+        optimized_ltv = 0.5
         optimized_rate = r_f + 0.02 * (sigma / theta)
         optimized_amount = CollateralValue_t * optimized_ltv
         optimized_btc = optimized_amount / BTC_t
@@ -133,7 +137,8 @@ def calculate(request):
             'reduced_risk': erosion_prob
         }
 
-        return JsonResponse({
+        # Prepare the response data
+        response_data = {
             'nav': {
                 'avg_nav': avg_nav,
                 'ci_lower': ci_nav_lower,
@@ -172,11 +177,99 @@ def calculate(request):
             },
             'term_sheet': term_sheet,
             'business_impact': business_impact
-        })
+        }
+
+        # Handle export format
+        if export_format.lower() == 'csv':
+            # Create a DataFrame for CSV export
+            df = pd.DataFrame({
+                'Metric': [
+                    'Average NAV', 'NAV CI Lower', 'NAV CI Upper', 'NAV Erosion Probability',
+                    'Base Dilution', 'Average Dilution', 'Dilution CI Lower', 'Dilution CI Upper',
+                    'Average Convertible Value', 'Convertible CI Lower', 'Convertible CI Upper',
+                    'Average LTV', 'LTV CI Lower', 'LTV CI Upper', 'LTV Exceed Probability',
+                    'Average ROE', 'ROE CI Lower', 'ROE CI Upper', 'Sharpe Ratio',
+                    'Preferred Bundle Value', 'Bundle CI Lower', 'Bundle CI Upper',
+                    'Term Sheet Structure', 'Term Sheet Amount', 'Term Sheet Rate', 'Term Sheet Term',
+                    'Term Sheet LTV Cap', 'Term Sheet Collateral', 'Term Sheet Conversion Premium',
+                    'Term Sheet BTC Bought', 'Term Sheet Savings', 'Term Sheet ROE Uplift',
+                    'Business Impact BTC Could Buy', 'Business Impact Savings', 'Business Impact Kept Money',
+                    'Business Impact ROE Uplift', 'Business Impact Reduced Risk'
+                ],
+                'Value': [
+                    avg_nav, ci_nav_lower, ci_nav_upper, erosion_prob,
+                    base_dilution, avg_dilution, ci_dilution_lower, ci_dilution_upper,
+                    avg_convertible, ci_convertible_lower, ci_convertible_upper,
+                    avg_ltv, ci_ltv_lower, ci_ltv_upper, ltv_exceed_prob,
+                    avg_roe, ci_roe_lower, ci_roe_upper, sharpe,
+                    bundle_value, ci_bundle_lower, ci_bundle_upper,
+                    term_sheet['structure'], term_sheet['amount'], term_sheet['rate'],
+                    term_sheet['term'], term_sheet['ltv_cap'], term_sheet['collateral'],
+                    term_sheet['conversion_premium'], term_sheet['btc_bought'], term_sheet['savings'],
+                    term_sheet['roe_uplift'], business_impact['btc_could_buy'], business_impact['savings'],
+                    business_impact['kept_money'], business_impact['roe_uplift'], business_impact['reduced_risk']
+                ]
+            })
+
+            # Generate CSV
+            output = StringIO()
+            df.to_csv(output, index=False)
+            output.seek(0)
+
+            # Create response
+            response = HttpResponse(
+                content_type='text/csv',
+                headers={'Content-Disposition': 'attachment; filename="calculation_results.csv"'},
+            )
+            response.write(output.getvalue())
+            return response
+
+        elif export_format.lower() == 'pdf':
+            # Create a PDF
+            buffer = BytesIO()
+            p = canvas.Canvas(buffer, pagesize=letter)
+            p.setFont("Helvetica", 12)
+            y = 750
+            p.drawString(50, y, "Calculation Results")
+            y -= 20
+            p.drawString(50, y, "-" * 50)
+            y -= 20
+
+            # Add results to PDF
+            for section, values in response_data.items():
+                p.drawString(50, y, f"{section.capitalize()}:")
+                y -= 20
+                for key, value in values.items():
+                    if isinstance(value, list):
+                        value = f"List of {len(value)} values"  # Summarize lists for PDF
+                    p.drawString(70, y, f"{key}: {value}")
+                    y -= 20
+                    if y < 50:
+                        p.showPage()
+                        y = 750
+                y -= 10
+
+            p.showPage()
+            p.save()
+            buffer.seek(0)
+
+            # Create response
+            response = HttpResponse(
+                content_type='application/pdf',
+                headers={'Content-Disposition': 'attachment; filename="calculation_results.pdf"'},
+            )
+            response.write(buffer.getvalue())
+            buffer.close()
+            return response
+
+        else:
+            # Default JSON response
+            return JsonResponse(response_data)
+
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
 
-@csrf_exempt  # Disable CSRF for simplicity (use proper CSRF handling in production)
+@csrf_exempt
 @require_POST
 def what_if(request):
     try:
@@ -184,6 +277,7 @@ def what_if(request):
         param = data.get('param')
         value = data.get('value')
         assumptions = data.get('assumptions', {})
+        export_format = data.get('format', 'json')  # Default to JSON
 
         # Optimization logic for LTV_Cap
         if param == 'LTV_Cap' and value == 'optimize':
@@ -191,8 +285,8 @@ def what_if(request):
             min_prob = 1.0
             for ltv in np.arange(0.1, 0.9, 0.05):
                 assumptions['LTV_Cap'] = ltv
-                ltv_t = (assumptions.get('LoanPrincipal', 50000000) / 
-                         (assumptions.get('BTC_0', 1000) * assumptions.get('BTC_t', 117000)) * 
+                ltv_t = (assumptions.get('LoanPrincipal', 50000000) /
+                         (assumptions.get('BTC_0', 1000) * assumptions.get('BTC_t', 117000)) *
                          (assumptions.get('BTC_t', 117000) / 117000))
                 prob = np.mean(ltv_t > ltv)
                 if prob < min_prob:
@@ -205,8 +299,8 @@ def what_if(request):
             max_roe = 0.0
             for beta in np.arange(1.0, 3.0, 0.1):
                 assumptions['beta_ROE'] = beta
-                roe_t = (assumptions.get('r_f', 0.04) + 
-                         beta * (assumptions.get('E_R_BTC', 0.45) - assumptions.get('r_f', 0.04)) * 
+                roe_t = (assumptions.get('r_f', 0.04) +
+                         beta * (assumptions.get('E_R_BTC', 0.45) - assumptions.get('r_f', 0.04)) *
                          (1 + assumptions.get('sigma', 0.55) / assumptions.get('theta', 0.5)))
                 if np.mean(roe_t) > max_roe:
                     max_roe = np.mean(roe_t)
@@ -305,7 +399,8 @@ def what_if(request):
             'reduced_risk': erosion_prob
         }
 
-        return JsonResponse({
+        # Prepare the response data
+        response_data = {
             'nav': {
                 'avg_nav': avg_nav,
                 'ci_lower': ci_nav_lower,
@@ -344,6 +439,94 @@ def what_if(request):
             },
             'term_sheet': term_sheet,
             'business_impact': business_impact
-        })
+        }
+
+        # Handle export format
+        if export_format.lower() == 'csv':
+            # Create a DataFrame for CSV export
+            df = pd.DataFrame({
+                'Metric': [
+                    'Average NAV', 'NAV CI Lower', 'NAV CI Upper', 'NAV Erosion Probability',
+                    'Base Dilution', 'Average Dilution', 'Dilution CI Lower', 'Dilution CI Upper',
+                    'Average Convertible Value', 'Convertible CI Lower', 'Convertible CI Upper',
+                    'Average LTV', 'LTV CI Lower', 'LTV CI Upper', 'LTV Exceed Probability',
+                    'Average ROE', 'ROE CI Lower', 'ROE CI Upper', 'Sharpe Ratio',
+                    'Preferred Bundle Value', 'Bundle CI Lower', 'Bundle CI Upper',
+                    'Term Sheet Structure', 'Term Sheet Amount', 'Term Sheet Rate', 'Term Sheet Term',
+                    'Term Sheet LTV Cap', 'Term Sheet Collateral', 'Term Sheet Conversion Premium',
+                    'Term Sheet BTC Bought', 'Term Sheet Savings', 'Term Sheet ROE Uplift',
+                    'Business Impact BTC Could Buy', 'Business Impact Savings', 'Business Impact Kept Money',
+                    'Business Impact ROE Uplift', 'Business Impact Reduced Risk'
+                ],
+                'Value': [
+                    avg_nav, ci_nav_lower, ci_nav_upper, erosion_prob,
+                    base_dilution, avg_dilution, ci_dilution_lower, ci_dilution_upper,
+                    avg_convertible, ci_convertible_lower, ci_convertible_upper,
+                    avg_ltv, ci_ltv_lower, ci_ltv_upper, ltv_exceed_prob,
+                    avg_roe, ci_roe_lower, ci_roe_upper, sharpe,
+                    bundle_value, ci_bundle_lower, ci_bundle_upper,
+                    term_sheet['structure'], term_sheet['amount'], term_sheet['rate'],
+                    term_sheet['term'], term_sheet['ltv_cap'], term_sheet['collateral'],
+                    term_sheet['conversion_premium'], term_sheet['btc_bought'], term_sheet['savings'],
+                    term_sheet['roe_uplift'], business_impact['btc_could_buy'], business_impact['savings'],
+                    business_impact['kept_money'], business_impact['roe_uplift'], business_impact['reduced_risk']
+                ]
+            })
+
+            # Generate CSV
+            output = StringIO()
+            df.to_csv(output, index=False)
+            output.seek(0)
+
+            # Create response
+            response = HttpResponse(
+                content_type='text/csv',
+                headers={'Content-Disposition': 'attachment; filename="what_if_results.csv"'},
+            )
+            response.write(output.getvalue())
+            return response
+
+        elif export_format.lower() == 'pdf':
+            # Create a PDF
+            buffer = BytesIO()
+            p = canvas.Canvas(buffer, pagesize=letter)
+            p.setFont("Helvetica", 12)
+            y = 750
+            p.drawString(50, y, "What-If Analysis Results")
+            y -= 20
+            p.drawString(50, y, "-" * 50)
+            y -= 20
+
+            # Add results to PDF
+            for section, values in response_data.items():
+                p.drawString(50, y, f"{section.capitalize()}:")
+                y -= 20
+                for key, value in values.items():
+                    if isinstance(value, list):
+                        value = f"List of {len(value)} values"  # Summarize lists for PDF
+                    p.drawString(70, y, f"{key}: {value}")
+                    y -= 20
+                    if y < 50:
+                        p.showPage()
+                        y = 750
+                y -= 10
+
+            p.showPage()
+            p.save()
+            buffer.seek(0)
+
+            # Create response
+            response = HttpResponse(
+                content_type='application/pdf',
+                headers={'Content-Disposition': 'attachment; filename="what_if_results.pdf"'},
+            )
+            response.write(buffer.getvalue())
+            buffer.close()
+            return response
+
+        else:
+            # Default JSON response
+            return JsonResponse(response_data)
+
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=400)
