@@ -207,9 +207,12 @@ def calculate(request):
         
         validate_inputs(params)
         if params['use_live']:
-            btc_price = fetch_btc_price()
-            if btc_price:
-                params['BTC_t'] = btc_price
+            try:
+                btc_price = fetch_btc_price()
+                if btc_price:
+                    params['BTC_t'] = btc_price
+            except Exception as e:
+                print(f"BTC price fetch failed, using default BTC_t: {str(e)}")
         
         btc_prices, vol_heston = simulate_btc_paths(params)
         response_data = calculate_metrics(params, btc_prices, vol_heston)
