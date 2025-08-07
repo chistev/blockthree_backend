@@ -168,19 +168,24 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
     y = 750
     c.drawString(100, y, title)
     y -= 30
-    for key, value in [
-        (f"Average NAV: {metrics['nav']['avg_nav']:.2f}",),
-        (f"Average Dilution: {metrics['dilution']['avg_dilution']:.4f}",),
-        (f"Average LTV: {metrics['ltv']['avg_ltv']:.4f}",),
-        (f"Average ROE: {metrics['roe']['avg_roe']:.4f}",),
-        (f"Bundle Value: {metrics['preferred_bundle']['bundle_value']:.2f}",),
-        (f"Term Structure: {metrics['term_sheet']['structure']}",),
-        (f"Term Amount: {metrics['term_sheet']['amount']:.2f}",),
-        (f"Term Rate: {metrics['term_sheet']['rate']:.4f}",),
-        (f"BTC Bought: {metrics['term_sheet']['btc_bought']:.2f}",)
-    ]:
-        c.drawString(100, y, value)
+    
+    # Create a list of strings to display
+    items = [
+        f"Average NAV: {metrics['nav']['avg_nav']:.2f}",
+        f"Average Dilution: {metrics['dilution']['avg_dilution']:.4f}",
+        f"Average LTV: {metrics['ltv']['avg_ltv']:.4f}",
+        f"Average ROE: {metrics['roe']['avg_roe']:.4f}",
+        f"Bundle Value: {metrics['preferred_bundle']['bundle_value']:.2f}",
+        f"Term Structure: {metrics['term_sheet']['structure']}",
+        f"Term Amount: {metrics['term_sheet']['amount']:.2f}",
+        f"Term Rate: {metrics['term_sheet']['rate']:.4f}",
+        f"BTC Bought: {metrics['term_sheet']['btc_bought']:.2f}"
+    ]
+    
+    for item in items:
+        c.drawString(100, y, item)
         y -= 20
+    
     c.showPage()
     c.save()
     pdf = buffer.getvalue()
