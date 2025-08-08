@@ -301,3 +301,13 @@ def what_if(request):
         elif params['export_format'] == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
+
+@csrf_exempt
+def get_btc_price(request):
+    try:
+        btc_price = fetch_btc_price()
+        if btc_price is None:
+            return JsonResponse({'error': 'Failed to fetch live BTC price'}, status=500)
+        return JsonResponse({'BTC_current_market_price': btc_price})
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
