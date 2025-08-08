@@ -212,7 +212,7 @@ class TestCalculateView(unittest.TestCase):
         self.valid_data = {
             'assumptions': {  # Wrap parameters in 'assumptions' to match get_json_data
                 'BTC_treasury': 1000,  # Changed from 'BTC_0'
-                'BTC_t': 117000,
+                'BTC_current_market_price': 117000,
                 'mu': 0.45,
                 'sigma': 0.55,
                 't': 1,
@@ -385,7 +385,7 @@ class TestCalculateView(unittest.TestCase):
             response = calculate(request)
             self.assertEqual(response.status_code, 200)
             mock_fetch_btc_price.assert_called_once()
-            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_t'], 120000.00)
+            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_current_market_price'], 120000.00)
 
     def test_calculate_invalid_inputs(self):
         invalid_data = self.valid_data.copy()
@@ -403,7 +403,7 @@ class TestCalculateView(unittest.TestCase):
         response = calculate(request)
         self.assertEqual(response.status_code, 400)
         response_data = json.loads(response.content)
-        self.assertIn('S_0, BTC_t, and BTC_treasury must be positive', response_data['error'])
+        self.assertIn('S_0, BTC_current_market_price, and BTC_treasury must be positive', response_data['error'])
 
     @patch('risk_calculator.views.simulate_btc_paths')
     @patch('risk_calculator.views.calculate_metrics')
@@ -429,7 +429,7 @@ class TestCalculateView(unittest.TestCase):
             mock_calculate_metrics.return_value = {'nav': {'avg_nav': 1234.56}}
             response = calculate(request)
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_t'], self.valid_data['assumptions']['BTC_t'])
+            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_current_market_price'], self.valid_data['assumptions']['BTC_current_market_price'])
 
     @patch('risk_calculator.views.fetch_btc_price')
     @patch('risk_calculator.views.simulate_btc_paths')

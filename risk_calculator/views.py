@@ -14,7 +14,7 @@ from reportlab.pdfgen import canvas
 DEFAULT_PARAMS = {
     'BTC_treasury': 1000,  # Initial BTC in treasury
     'BTC_purchased': 0,    # BTC purchased with loan proceeds
-    'BTC_t': 117000, 'mu': 0.45, 'sigma': 0.55, 't': 1, 'delta': 0.08,
+    'BTC_current_market_price': 117000, 'mu': 0.45, 'sigma': 0.55, 't': 1, 'delta': 0.08,
     'S_0': 1000000, 'delta_S': 50000, 'IssuePrice': 117000, 'LoanPrincipal': 50000000,
     'C_Debt': 0.06, 'vol_fixed': 0.55, 'LTV_Cap': 0.5, 'beta_ROE': 2.5, 'E_R_BTC': 0.45,
     'r_f': 0.04, 'kappa': 0.5, 'theta': 0.5, 'paths': 10000, 'lambda_j': 0.1,
@@ -35,8 +35,8 @@ def fetch_btc_price():
 def validate_inputs(params):
     if params['theta'] == 0:
         raise ValueError("theta cannot be zero to avoid division by zero")
-    if params['S_0'] <= 0 or params['BTC_t'] <= 0 or params['BTC_treasury'] <= 0:
-        raise ValueError("S_0, BTC_t, and BTC_treasury must be positive")
+    if params['S_0'] <= 0 or params['BTC_current_market_price'] <= 0 or params['BTC_treasury'] <= 0:
+        raise ValueError("S_0, BTC_current_market_price, and BTC_treasury must be positive")
     if params['BTC_purchased'] < 0:
         raise ValueError("BTC_purchased cannot be negative")
 
@@ -110,11 +110,11 @@ def calculate_metrics(params, btc_prices, vol_heston):
     optimized_ltv = 0.5 if exceed_prob < 0.15 else params['LTV_Cap']
     optimized_rate = params['r_f'] + 0.02 * (params['sigma'] / params['theta'])
     optimized_amount = CollateralValue_t * optimized_ltv
-    optimized_btc = optimized_amount / params['BTC_t']
+    optimized_btc = optimized_amount / params['BTC_current_market_price']
     params['BTC_purchased'] = optimized_btc  # Update BTC_purchased for consistency
-    adjusted_savings = (base_dilution * params['S_0'] * params['BTC_t']) - avg_dilution
+    adjusted_savings = (base_dilution * params['S_0'] * params['BTC_current_market_price']) - avg_dilution
     roe_uplift = avg_roe - (params['E_R_BTC'] * params['beta_ROE'])
-    kept_money = adjusted_savings + roe_uplift * params['S_0'] * params['BTC_t']
+    kept_money = adjusted_savings + roe_uplift * params['S_0'] * params['BTC_current_market_price']
     
     term_sheet = {
         'structure': 'Convertible Note' if avg_dilution < 0.1 else 'BTC-Collateralized Loan',
@@ -217,9 +217,9 @@ def calculate(request):
             try:
                 btc_price = fetch_btc_price()
                 if btc_price:
-                    params['BTC_t'] = btc_price
+                    params['BTC_current_market_price'] = btc_price
             except Exception as e:
-                print(f"BTC price fetch failed, using default BTC_t: {str(e)}")
+                print(f"BTC price fetch failed, using default BTC_current_market_price: {str(e)}")
         
         btc_prices, vol_heston = simulate_btc_paths(params)
         response_data = calculate_metrics(params, btc_prices, vol_heston)
@@ -255,14 +255,14 @@ def what_if(request):
         if params['use_live']:
             btc_price = fetch_btc_price()
             if btc_price:
-                params['BTC_t'] = btc_price
+                params['BTC_current_market_price'] = btc_price
         
         # Optimization logic
         if param == 'LTV_Cap' and value == 'optimize':
             best_ltv = 0.5
             min_prob = 1.0
             total_btc = params['BTC_treasury'] + params['BTC_purchased']
-            CollateralValue_t = total_btc * params['BTC_t']
+            CollateralValue_t = total_btc * params['BTC_current_market_price']
             dt = params['t'] / params['paths']
             for ltv in np.arange(0.1, 0.9, 0.05):
                 jumps = levy_stable.rvs(alpha=1.5, beta=0, size=params['paths']) * 0.15 * dt

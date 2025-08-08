@@ -61,7 +61,7 @@ class TestValidateInputs(TestCase):
         params = {
             'theta': 0.5,
             'S_0': 1000000,
-            'BTC_t': 117000,
+            'BTC_current_market_price': 117000,
             'BTC_treasury': 1000,  # Added to match updated validate_inputs
             'BTC_purchased': 0
         }
@@ -75,7 +75,7 @@ class TestValidateInputs(TestCase):
         params = {
             'theta': 0,
             'S_0': 1000000,
-            'BTC_t': 117000
+            'BTC_current_market_price': 117000
         }
         with self.assertRaises(ValueError) as context:
             validate_inputs(params)
@@ -85,19 +85,19 @@ class TestValidateInputs(TestCase):
         params = {
             'theta': 0.5,
             'S_0': -100,
-            'BTC_t': 117000,
+            'BTC_current_market_price': 117000,
             'BTC_treasury': 1000
         }
         with self.assertRaises(ValueError) as context:
             validate_inputs(params)
-        self.assertIn("S_0, BTC_t, and BTC_treasury must be positive", str(context.exception))
+        self.assertIn("S_0, BTC_current_market_price, and BTC_treasury must be positive", str(context.exception))
 
 
     def test_zero_theta_raises_error(self):
         params = {
             'theta': 0,
             'S_0': 1000000,
-            'BTC_t': 117000,
+            'BTC_current_market_price': 117000,
             'BTC_treasury': 1000
         }
         with self.assertRaises(ValueError) as context:
@@ -108,7 +108,7 @@ class TestValidateInputs(TestCase):
         params = {
             'theta': 0.5,
             'S_0': 1000000,
-            'BTC_t': 117000,
+            'BTC_current_market_price': 117000,
             'BTC_treasury': 1000,
             'BTC_purchased': -100  # Negative value to trigger the error
         }
@@ -198,7 +198,7 @@ class TestCalculateMetrics(TestCase):
         # Initialize default parameters and sample inputs
         self.params = DEFAULT_PARAMS.copy()
         self.params['paths'] = 1000  # Reduce paths for faster testing
-        self.btc_prices = np.ones(self.params['paths']) * self.params['BTC_t']  # Constant price for deterministic tests
+        self.btc_prices = np.ones(self.params['paths']) * self.params['BTC_current_market_price']  # Constant price for deterministic tests
         self.vol_heston = np.ones(self.params['paths'] - 1) * self.params['theta']  # Constant volatility
         np.random.seed(42)  # Set seed for reproducibility
 
@@ -249,7 +249,7 @@ class TestCalculateMetrics(TestCase):
     def test_convertible_value_black_scholes(self):
         """Test convertible value using Black-Scholes formula."""
         result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
-        S = self.params['BTC_treasury'] * self.params['BTC_t']
+        S = self.params['BTC_treasury'] * self.params['BTC_current_market_price']
         d1 = (np.log(S / self.params['IssuePrice']) + (self.params['r_f'] + self.params['delta'] + 0.5 * self.vol_heston[-1] ** 2) * self.params['t']) / (
             self.vol_heston[-1] * np.sqrt(self.params['t']))
         d2 = d1 - self.vol_heston[-1] * np.sqrt(self.params['t'])
@@ -260,7 +260,7 @@ class TestCalculateMetrics(TestCase):
     def test_ltv_calculation(self):
         """Test LTV calculation and exceedance probability."""
         result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
-        expected_ltv = self.params['LoanPrincipal'] / (self.params['BTC_treasury'] * self.params['BTC_t'])
+        expected_ltv = self.params['LoanPrincipal'] / (self.params['BTC_treasury'] * self.params['BTC_current_market_price'])
         self.assertAlmostEqual(result['ltv']['avg_ltv'], expected_ltv, places=2, msg="Average LTV calculation is incorrect")
         self.assertEqual(result['ltv']['exceed_prob'], 0, "Exceedance probability should be 0 for constant BTC prices")
         self.assertTrue(all(ltv == expected_ltv for ltv in result['ltv']['ltv_paths']), "LTV paths should be constant for constant BTC prices")
@@ -297,23 +297,23 @@ class TestCalculateMetrics(TestCase):
         """Test business impact metrics like savings and kept money."""
         result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
         base_dilution = self.params['delta_S'] / (self.params['S_0'] + self.params['delta_S'])
-        expected_savings = base_dilution * self.params['S_0'] * self.params['BTC_t'] - result['dilution']['avg_dilution']
+        expected_savings = base_dilution * self.params['S_0'] * self.params['BTC_current_market_price'] - result['dilution']['avg_dilution']
         self.assertAlmostEqual(result['business_impact']['savings'], expected_savings, places=2, 
                                msg="Savings calculation is incorrect")
         roe_uplift = result['roe']['avg_roe'] - (self.params['E_R_BTC'] * self.params['beta_ROE'])
-        expected_kept_money = expected_savings + roe_uplift * self.params['S_0'] * self.params['BTC_t']
+        expected_kept_money = expected_savings + roe_uplift * self.params['S_0'] * self.params['BTC_current_market_price']
         self.assertAlmostEqual(result['business_impact']['kept_money'], expected_kept_money, places=2, 
                                msg="Kept money calculation is incorrect")
         
     def test_edge_case_low_btc_price(self):
         """Test behavior with very low BTC prices (high LTV)."""
         # Calculate baseline NAV with default BTC prices
-        baseline_btc_prices = np.ones(self.params['paths']) * self.params['BTC_t']  # Default BTC_t = 117000
+        baseline_btc_prices = np.ones(self.params['paths']) * self.params['BTC_current_market_price']  # Default BTC_current_market_price = 117000
         baseline_result = calculate_metrics(self.params, baseline_btc_prices, self.vol_heston)
         baseline_nav = baseline_result['nav']['avg_nav']
         
         # Test with low BTC prices (10% of default)
-        low_btc_prices = np.ones(self.params['paths']) * self.params['BTC_t'] * 0.1  # BTC_t = 11700
+        low_btc_prices = np.ones(self.params['paths']) * self.params['BTC_current_market_price'] * 0.1  # BTC_current_market_price = 11700
         result = calculate_metrics(self.params, low_btc_prices, self.vol_heston)
         
         # Check LTV is high

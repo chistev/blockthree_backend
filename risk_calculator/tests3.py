@@ -14,7 +14,7 @@ class TestWhatIfView(TestCase):
             'value': '0.5',
             'assumptions': {
                 'BTC_0': 1000,
-                'BTC_t': 117000,
+                'BTC_current_market_price': 117000,
                 'mu': 0.45,
                 'sigma': 0.55,
                 't': 1,
@@ -234,7 +234,7 @@ class TestWhatIfView(TestCase):
             response = what_if(request)
             self.assertEqual(response.status_code, 200)
             mock_fetch_btc_price.assert_called_once()
-            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_t'], 120000.00)
+            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_current_market_price'], 120000.00)
 
     def test_what_if_invalid_inputs_theta(self):
         # Test invalid theta input
@@ -254,7 +254,7 @@ class TestWhatIfView(TestCase):
         response = what_if(request)
         self.assertEqual(response.status_code, 400)
         response_data = json.loads(response.content)
-        self.assertIn('S_0, BTC_t, and BTC_treasury must be positive', response_data['error'])
+        self.assertIn('S_0, BTC_current_market_price, and BTC_treasury must be positive', response_data['error'])
 
     @patch('risk_calculator.views.simulate_btc_paths')
     @patch('risk_calculator.views.calculate_metrics')
