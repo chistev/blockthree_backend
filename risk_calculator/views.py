@@ -12,7 +12,9 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 DEFAULT_PARAMS = {
-    'BTC_0': 1000, 'BTC_t': 117000, 'mu': 0.45, 'sigma': 0.55, 't': 1, 'delta': 0.08,
+    'BTC_treasury': 1000,  # Initial BTC in treasury
+    'BTC_purchased': 0,    # BTC purchased with loan proceeds
+    'BTC_t': 117000, 'mu': 0.45, 'sigma': 0.55, 't': 1, 'delta': 0.08,
     'S_0': 1000000, 'delta_S': 50000, 'IssuePrice': 117000, 'LoanPrincipal': 50000000,
     'C_Debt': 0.06, 'vol_fixed': 0.55, 'LTV_Cap': 0.5, 'beta_ROE': 2.5, 'E_R_BTC': 0.45,
     'r_f': 0.04, 'kappa': 0.5, 'theta': 0.5, 'paths': 10000, 'lambda_j': 0.1,
@@ -33,38 +35,40 @@ def fetch_btc_price():
 def validate_inputs(params):
     if params['theta'] == 0:
         raise ValueError("theta cannot be zero to avoid division by zero")
-    if params['S_0'] <= 0 or params['BTC_t'] <= 0:
-        raise ValueError("S_0 and BTC_t must be positive")
+    if params['S_0'] <= 0 or params['BTC_t'] <= 0 or params['BTC_treasury'] <= 0:
+        raise ValueError("S_0, BTC_t, and BTC_treasury must be positive")
+    if params['BTC_purchased'] < 0:
+        raise ValueError("BTC_purchased cannot be negative")
 
 def simulate_btc_paths(params):
     dt = params['t'] / params['paths']
     mu_bayes = 0.5 * params['mu'] + 0.5 * 0.4
     mu_adj = mu_bayes - params['lambda_j'] * (np.exp(params['mu_j'] + 0.5 * params['sigma_j']**2) - 1)
     
-    # Initial path for GARCH
+    # Use BTC_treasury for initial price scaling
     btc_returns_init = np.random.normal(loc=mu_adj * dt, scale=params['sigma'] * np.sqrt(dt), size=params['paths'])
-    btc_prices_init = params['BTC_0'] * np.exp(np.cumsum(btc_returns_init))
+    btc_prices_init = params['BTC_treasury'] * np.exp(np.cumsum(btc_returns_init))
     log_returns = np.log(btc_prices_init[1:] / btc_prices_init[:-1]) * 100
     garch_model = arch_model(log_returns, p=1, q=1)
     garch_fit = garch_model.fit(disp='off')
     vol_garch = garch_fit.conditional_volatility / 100
     vol_heston = params['theta'] + (params['sigma'] - params['theta']) * np.exp(-params['kappa'] * np.linspace(0, params['t'], len(vol_garch))) + vol_garch
 
-    # Final paths with jumps
     btc_returns = np.zeros(params['paths'])
     for i in range(params['paths']):
         btc_returns[i] = np.random.normal(loc=mu_adj * dt, scale=vol_heston[min(i, len(vol_heston)-1)] * np.sqrt(dt))
         if np.random.random() < params['lambda_j'] * dt:
             btc_returns[i] += np.random.normal(params['mu_j'], params['sigma_j'])
-    return params['BTC_0'] * np.exp(np.cumsum(btc_returns)), vol_heston
+    return params['BTC_treasury'] * np.exp(np.cumsum(btc_returns)), vol_heston
 
 def calculate_metrics(params, btc_prices, vol_heston):
     final_btc_price = btc_prices[-1]
-    CollateralValue_t = params['BTC_0'] * final_btc_price
+    total_btc = params['BTC_treasury'] + params['BTC_purchased']
+    CollateralValue_t = total_btc * final_btc_price
     base_dilution = params['delta_S'] / (params['S_0'] + params['delta_S'])
     
     # NAV
-    nav_paths_temp = [(params['BTC_0'] * p + params['BTC_0'] * p * params['delta'] - params['LoanPrincipal'] * params['C_Debt']) / 
+    nav_paths_temp = [(total_btc * p + total_btc * p * params['delta'] - params['LoanPrincipal'] * params['C_Debt']) / 
                      (params['S_0'] + params['delta_S']) for p in btc_prices]
     dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * params['IssuePrice'], nav, params['vol_fixed'] * np.sqrt(params['t']))) 
                      for nav in nav_paths_temp]
@@ -79,7 +83,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
     ci_dilution = 1.96 * np.std(dilution_paths) / np.sqrt(params['paths'])
     
     # Convertible value
-    S = final_btc_price * params['BTC_0']
+    S = final_btc_price * total_btc
     if vol_heston[-1] == 0:
         raise ZeroDivisionError("Volatility (vol_heston[-1]) cannot be zero in Black-Scholes calculation")
     d1 = (np.log(S / params['IssuePrice']) + (params['r_f'] + params['delta'] + 0.5 * vol_heston[-1] ** 2) * params['t']) / (vol_heston[-1] * np.sqrt(params['t']))
@@ -87,7 +91,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
     convertible_value = S * norm.cdf(d1) - params['IssuePrice'] * np.exp(-(params['r_f'] + params['delta']) * params['t']) * norm.cdf(d2)
         
     # LTV
-    ltv_paths = [params['LoanPrincipal'] / (params['BTC_0'] * p) for p in btc_prices]
+    ltv_paths = [params['LoanPrincipal'] / (total_btc * p) for p in btc_prices]
     avg_ltv = np.mean(ltv_paths)
     ci_ltv = 1.96 * np.std(ltv_paths) / np.sqrt(params['paths'])
     exceed_prob = np.mean(np.array(ltv_paths) > params['LTV_Cap'])
@@ -107,6 +111,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
     optimized_rate = params['r_f'] + 0.02 * (params['sigma'] / params['theta'])
     optimized_amount = CollateralValue_t * optimized_ltv
     optimized_btc = optimized_amount / params['BTC_t']
+    params['BTC_purchased'] = optimized_btc  # Update BTC_purchased for consistency
     adjusted_savings = (base_dilution * params['S_0'] * params['BTC_t']) - avg_dilution
     roe_uplift = avg_roe - (params['E_R_BTC'] * params['beta_ROE'])
     kept_money = adjusted_savings + roe_uplift * params['S_0'] * params['BTC_t']
@@ -120,6 +125,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'collateral': CollateralValue_t,
         'conversion_premium': 0.3 if convertible_value > 0 else 0,
         'btc_bought': optimized_btc,
+        'total_btc_treasury': total_btc,
         'savings': adjusted_savings,
         'roe_uplift': roe_uplift * 100
     }
@@ -149,12 +155,13 @@ def generate_csv_response(metrics):
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(['Average NAV', 'Average Dilution', 'Average LTV', 'Average ROE', 'Bundle Value',
-                     'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought'])
+                     'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury'])
     writer.writerow([f"{metrics['nav']['avg_nav']:.2f}", f"{metrics['dilution']['avg_dilution']:.4f}",
                      f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['roe']['avg_roe']:.4f}",
                      f"{metrics['preferred_bundle']['bundle_value']:.2f}", 
                      metrics['term_sheet']['structure'], f"{metrics['term_sheet']['amount']:.2f}",
-                     f"{metrics['term_sheet']['rate']:.4f}", f"{metrics['term_sheet']['btc_bought']:.2f}"])
+                     f"{metrics['term_sheet']['rate']:.4f}", f"{metrics['term_sheet']['btc_bought']:.2f}",
+                     f"{metrics['term_sheet']['total_btc_treasury']:.2f}"])
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="metrics.csv"'
     response.write(output.getvalue().encode('utf-8'))
@@ -169,7 +176,6 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
     c.drawString(100, y, title)
     y -= 30
     
-    # Create a list of strings to display
     items = [
         f"Average NAV: {metrics['nav']['avg_nav']:.2f}",
         f"Average Dilution: {metrics['dilution']['avg_dilution']:.4f}",
@@ -179,7 +185,8 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Term Structure: {metrics['term_sheet']['structure']}",
         f"Term Amount: {metrics['term_sheet']['amount']:.2f}",
         f"Term Rate: {metrics['term_sheet']['rate']:.4f}",
-        f"BTC Bought: {metrics['term_sheet']['btc_bought']:.2f}"
+        f"BTC Bought: {metrics['term_sheet']['btc_bought']:.2f}",
+        f"Total BTC Treasury: {metrics['term_sheet']['total_btc_treasury']:.2f}"
     ]
     
     for item in items:
@@ -200,7 +207,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
 def calculate(request):
     try:
         data = get_json_data(request)
-        params = {k: float(data.get(k, v)) if k != 'paths' else int(data.get(k, v)) 
+        params = {k: float(data.get('assumptions', {}).get(k, v)) if k != 'paths' else int(data.get('assumptions', {}).get(k, v)) 
                   for k, v in DEFAULT_PARAMS.items()}
         params['export_format'] = data.get('format', 'json').lower()
         params['use_live'] = data.get('use_live', False)
@@ -227,7 +234,7 @@ def calculate(request):
         error_response = f"Error: {str(e)}"
         if params.get('export_format') == 'csv':
             return HttpResponse(error_response, content_type='text/plain', status=400)
-        elif params.get('export_format') == 'pdf':
+        elif params['export_format'] == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
 
@@ -254,7 +261,8 @@ def what_if(request):
         if param == 'LTV_Cap' and value == 'optimize':
             best_ltv = 0.5
             min_prob = 1.0
-            CollateralValue_t = params['BTC_0'] * params['BTC_t']
+            total_btc = params['BTC_treasury'] + params['BTC_purchased']
+            CollateralValue_t = total_btc * params['BTC_t']
             dt = params['t'] / params['paths']
             for ltv in np.arange(0.1, 0.9, 0.05):
                 jumps = levy_stable.rvs(alpha=1.5, beta=0, size=params['paths']) * 0.15 * dt
@@ -290,7 +298,6 @@ def what_if(request):
         error_response = f"Error: {str(e)}"
         if params.get('export_format') == 'csv':
             return HttpResponse(error_response, content_type='text/plain', status=400)
-        elif params.get('export_format') == 'pdf':
+        elif params['export_format'] == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
-    

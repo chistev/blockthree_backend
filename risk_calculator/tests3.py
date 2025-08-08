@@ -254,7 +254,7 @@ class TestWhatIfView(TestCase):
         response = what_if(request)
         self.assertEqual(response.status_code, 400)
         response_data = json.loads(response.content)
-        self.assertIn('S_0 and BTC_t must be positive', response_data['error'])
+        self.assertIn('S_0, BTC_t, and BTC_treasury must be positive', response_data['error'])
 
     @patch('risk_calculator.views.simulate_btc_paths')
     @patch('risk_calculator.views.calculate_metrics')

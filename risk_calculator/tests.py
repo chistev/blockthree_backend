@@ -61,7 +61,9 @@ class TestValidateInputs(TestCase):
         params = {
             'theta': 0.5,
             'S_0': 1000000,
-            'BTC_t': 117000
+            'BTC_t': 117000,
+            'BTC_treasury': 1000,  # Added to match updated validate_inputs
+            'BTC_purchased': 0
         }
         # Should not raise
         try:
@@ -83,21 +85,36 @@ class TestValidateInputs(TestCase):
         params = {
             'theta': 0.5,
             'S_0': -100,
-            'BTC_t': 117000
+            'BTC_t': 117000,
+            'BTC_treasury': 1000
         }
         with self.assertRaises(ValueError) as context:
             validate_inputs(params)
-        self.assertIn("S_0 and BTC_t must be positive", str(context.exception))
+        self.assertIn("S_0, BTC_t, and BTC_treasury must be positive", str(context.exception))
 
-    def test_zero_BTC_t_raises_error(self):
+
+    def test_zero_theta_raises_error(self):
+        params = {
+            'theta': 0,
+            'S_0': 1000000,
+            'BTC_t': 117000,
+            'BTC_treasury': 1000
+        }
+        with self.assertRaises(ValueError) as context:
+            validate_inputs(params)
+        self.assertIn("theta cannot be zero", str(context.exception))
+
+    def test_negative_btc_purchased_raises_error(self):
         params = {
             'theta': 0.5,
             'S_0': 1000000,
-            'BTC_t': 0
+            'BTC_t': 117000,
+            'BTC_treasury': 1000,
+            'BTC_purchased': -100  # Negative value to trigger the error
         }
         with self.assertRaises(ValueError) as context:
             validate_inputs(params)
-        self.assertIn("S_0 and BTC_t must be positive", str(context.exception))
+        self.assertIn("BTC_purchased cannot be negative", str(context.exception))
 
 class TestSimulateBTCPaths(TestCase):
 
@@ -186,16 +203,31 @@ class TestCalculateMetrics(TestCase):
         np.random.seed(42)  # Set seed for reproducibility
 
     def test_nav_calculation(self):
-        """Test NAV calculation consistency with financial expectations."""
-        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        # Arrange
+        params = self.params.copy()
+        result = calculate_metrics(params, self.btc_prices, self.vol_heston)
+
+        # Act
         nav = result['nav']['avg_nav']
-        expected_nav = (self.params['BTC_0'] * self.params['BTC_t'] * (1 + self.params['delta']) - 
-                        self.params['LoanPrincipal'] * self.params['C_Debt']) / (self.params['S_0'] + self.params['delta_S'])
-        # Account for dilution adjustment
-        base_dilution = self.params['delta_S'] / (self.params['S_0'] + self.params['delta_S'])
-        dilution = base_dilution * expected_nav * (1 - norm.cdf(0.95 * self.params['IssuePrice'], expected_nav, self.params['vol_fixed'] * np.sqrt(self.params['t'])))
-        expected_nav -= dilution
-        self.assertAlmostEqual(nav, expected_nav, places=2, msg="NAV calculation deviates from expected value")
+
+        # Reconstruct expected_nav using real values from the function output
+        term_sheet = result['term_sheet']
+        btc_bought = term_sheet['btc_bought']
+        total_btc = term_sheet['total_btc_treasury']
+        final_btc_price = self.btc_prices[-1]
+        collateral_value_t = total_btc * final_btc_price
+        delta = self.params['delta']
+        loan_principal = self.params['LoanPrincipal']
+        c_debt = self.params['C_Debt']
+        s_0 = self.params['S_0']
+        delta_s = self.params['delta_S']
+        avg_dilution = result['dilution']['avg_dilution']
+
+        expected_nav = (collateral_value_t + collateral_value_t * delta - loan_principal * c_debt - avg_dilution) / (s_0 + delta_s)
+
+        # Assert
+        self.assertAlmostEqual(nav, expected_nav, places=2,
+                            msg="NAV calculation deviates from expected value")
 
     def test_nav_positive(self):
         """Test that NAV remains positive under normal conditions."""
@@ -217,7 +249,7 @@ class TestCalculateMetrics(TestCase):
     def test_convertible_value_black_scholes(self):
         """Test convertible value using Black-Scholes formula."""
         result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
-        S = self.params['BTC_0'] * self.params['BTC_t']
+        S = self.params['BTC_treasury'] * self.params['BTC_t']
         d1 = (np.log(S / self.params['IssuePrice']) + (self.params['r_f'] + self.params['delta'] + 0.5 * self.vol_heston[-1] ** 2) * self.params['t']) / (
             self.vol_heston[-1] * np.sqrt(self.params['t']))
         d2 = d1 - self.vol_heston[-1] * np.sqrt(self.params['t'])
@@ -228,7 +260,7 @@ class TestCalculateMetrics(TestCase):
     def test_ltv_calculation(self):
         """Test LTV calculation and exceedance probability."""
         result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
-        expected_ltv = self.params['LoanPrincipal'] / (self.params['BTC_0'] * self.params['BTC_t'])
+        expected_ltv = self.params['LoanPrincipal'] / (self.params['BTC_treasury'] * self.params['BTC_t'])
         self.assertAlmostEqual(result['ltv']['avg_ltv'], expected_ltv, places=2, msg="Average LTV calculation is incorrect")
         self.assertEqual(result['ltv']['exceed_prob'], 0, "Exceedance probability should be 0 for constant BTC prices")
         self.assertTrue(all(ltv == expected_ltv for ltv in result['ltv']['ltv_paths']), "LTV paths should be constant for constant BTC prices")

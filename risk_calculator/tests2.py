@@ -23,7 +23,8 @@ class TestGenerateCsvResponse(unittest.TestCase):
                 'structure': 'Convertible Note',
                 'amount': 1000000.789,
                 'rate': 0.045678,
-                'btc_bought': 12.3456
+                'btc_bought': 12.3456,
+                'total_btc_treasury': 1012.3456
             }
         }
 
@@ -44,7 +45,8 @@ class TestGenerateCsvResponse(unittest.TestCase):
         
         # Verify header row
         expected_headers = ['Average NAV', 'Average Dilution', 'Average LTV', 'Average ROE', 
-                           'Bundle Value', 'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought']
+                            'Bundle Value', 'Term Structure', 'Term Amount', 'Term Rate', 
+                            'BTC Bought', 'Total BTC Treasury']  # Added 'Total BTC Treasury'
         self.assertEqual(rows[0], expected_headers)
         
         # Verify data row
@@ -57,7 +59,8 @@ class TestGenerateCsvResponse(unittest.TestCase):
             'Convertible Note',  # term_sheet structure
             '1000000.79',  # term_amount formatted to 2 decimal places
             '0.0457',   # term_rate formatted to 4 decimal places
-            '12.35'     # btc_bought formatted to 2 decimal places
+            '12.35',    # btc_bought formatted to 2 decimal places
+            '1012.35'   # total_btc_treasury formatted to 2 decimal places
         ]
         self.assertEqual(rows[1], expected_data)
         
@@ -115,7 +118,8 @@ class TestGeneratePdfResponse(unittest.TestCase):
                 'structure': 'Convertible Note',
                 'amount': 1000000.789,
                 'rate': 0.045678,
-                'btc_bought': 12.3456
+                'btc_bought': 12.3456,
+                'total_btc_treasury': 1012.3456
             }
         }
         self.title = "Financial Metrics Report"
@@ -206,28 +210,30 @@ class TestCalculateView(unittest.TestCase):
         self.factory = RequestFactory()
         self.default_params = DEFAULT_PARAMS.copy()
         self.valid_data = {
-            'BTC_0': 1000,
-            'BTC_t': 117000,
-            'mu': 0.45,
-            'sigma': 0.55,
-            't': 1,
-            'delta': 0.08,
-            'S_0': 1000000,
-            'delta_S': 50000,
-            'IssuePrice': 117000,
-            'LoanPrincipal': 50000000,
-            'C_Debt': 0.06,
-            'vol_fixed': 0.55,
-            'LTV_Cap': 0.5,
-            'beta_ROE': 2.5,
-            'E_R_BTC': 0.45,
-            'r_f': 0.04,
-            'kappa': 0.5,
-            'theta': 0.5,
-            'paths': 100,
-            'lambda_j': 0.1,
-            'mu_j': 0.0,
-            'sigma_j': 0.2,
+            'assumptions': {  # Wrap parameters in 'assumptions' to match get_json_data
+                'BTC_treasury': 1000,  # Changed from 'BTC_0'
+                'BTC_t': 117000,
+                'mu': 0.45,
+                'sigma': 0.55,
+                't': 1,
+                'delta': 0.08,
+                'S_0': 1000000,
+                'delta_S': 50000,
+                'IssuePrice': 117000,
+                'LoanPrincipal': 50000000,
+                'C_Debt': 0.06,
+                'vol_fixed': 0.55,
+                'LTV_Cap': 0.5,
+                'beta_ROE': 2.5,
+                'E_R_BTC': 0.45,
+                'r_f': 0.04,
+                'kappa': 0.5,
+                'theta': 0.5,
+                'paths': 100,
+                'lambda_j': 0.1,
+                'mu_j': 0.0,
+                'sigma_j': 0.2,
+            },
             'format': 'json',
             'use_live': False
         }
@@ -287,7 +293,7 @@ class TestCalculateView(unittest.TestCase):
         self.assertGreater(response_data['nav']['avg_nav'], 0, "NAV should be positive")
         self.assertLess(response_data['dilution']['avg_dilution'], 1, "Dilution should be less than 100%")
         self.assertLess(response_data['ltv']['avg_ltv'], 1, "LTV should be less than 100%")
-        self.assertGreater(response_data['roe']['avg_roe'], self.valid_data['r_f'], "ROE should exceed risk-free rate")
+        self.assertGreater(response_data['roe']['avg_roe'], self.valid_data['assumptions']['r_f'], "ROE should exceed risk-free rate")
 
     @patch('risk_calculator.views.fetch_btc_price')
     @patch('risk_calculator.views.simulate_btc_paths')
@@ -383,7 +389,7 @@ class TestCalculateView(unittest.TestCase):
 
     def test_calculate_invalid_inputs(self):
         invalid_data = self.valid_data.copy()
-        invalid_data['theta'] = 0
+        invalid_data['assumptions']['theta'] = 0
         request = self.create_request(invalid_data)
         response = calculate(request)
         self.assertEqual(response.status_code, 400)
@@ -392,12 +398,12 @@ class TestCalculateView(unittest.TestCase):
 
     def test_calculate_negative_inputs(self):
         invalid_data = self.valid_data.copy()
-        invalid_data['S_0'] = -1000000
+        invalid_data['assumptions']['S_0'] = -1000000
         request = self.create_request(invalid_data)
         response = calculate(request)
         self.assertEqual(response.status_code, 400)
         response_data = json.loads(response.content)
-        self.assertIn('S_0 and BTC_t must be positive', response_data['error'])
+        self.assertIn('S_0, BTC_t, and BTC_treasury must be positive', response_data['error'])
 
     @patch('risk_calculator.views.simulate_btc_paths')
     @patch('risk_calculator.views.calculate_metrics')
@@ -418,12 +424,12 @@ class TestCalculateView(unittest.TestCase):
         request = self.create_request(data)
 
         with patch('risk_calculator.views.simulate_btc_paths') as mock_simulate_btc_paths, \
-             patch('risk_calculator.views.calculate_metrics') as mock_calculate_metrics:
+            patch('risk_calculator.views.calculate_metrics') as mock_calculate_metrics:
             mock_simulate_btc_paths.return_value = (np.array([117000] * 100), np.array([0.55] * 100))
             mock_calculate_metrics.return_value = {'nav': {'avg_nav': 1234.56}}
             response = calculate(request)
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_t'], self.valid_data['BTC_t'])
+            self.assertEqual(mock_calculate_metrics.call_args[0][0]['BTC_t'], self.valid_data['assumptions']['BTC_t'])
 
     @patch('risk_calculator.views.fetch_btc_price')
     @patch('risk_calculator.views.simulate_btc_paths')
