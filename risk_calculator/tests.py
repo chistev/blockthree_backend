@@ -133,3 +133,197 @@ class TestSimulateBTCPaths(unittest.TestCase):
         prices_low_target, _ = simulate_btc_paths(params_target_low)
         # On average, higher target price should push simulated final price higher
         self.assertGreater(np.mean(prices_high_target), np.mean(prices_low_target))
+
+import unittest
+import numpy as np
+from scipy.stats import norm
+from risk_calculator.views import calculate_metrics, DEFAULT_PARAMS
+
+class TestCalculateMetrics(unittest.TestCase):
+    
+    def setUp(self):
+        # Setup test parameters and mock data
+        self.params = DEFAULT_PARAMS.copy()
+        self.params['paths'] = 10000  # Smaller number for testing
+        np.random.seed(42)  # For reproducible tests
+        
+        # Generate mock BTC price paths
+        self.btc_prices = np.random.lognormal(
+            mean=np.log(self.params['BTC_current_market_price']), 
+            sigma=self.params['sigma'], 
+            size=self.params['paths']
+        )
+        
+        # Generate mock volatility path
+        self.vol_heston = np.full(self.params['paths'] - 1, self.params['sigma'])
+        
+    def test_basic_output_structure(self):
+        """Test that the function returns all expected output sections"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        
+        expected_sections = [
+            'nav', 'dilution', 'convertible', 'ltv', 'roe',
+            'preferred_bundle', 'term_sheet', 'business_impact',
+            'target_metrics', 'scenario_metrics'
+        ]
+        
+        for section in expected_sections:
+            self.assertIn(section, result)
+    
+    def test_nav_calculation(self):
+        """Test Net Asset Value calculations"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        nav = result['nav']
+        
+        # Basic checks
+        self.assertIsInstance(nav['avg_nav'], float)
+        self.assertGreater(nav['avg_nav'], 0)
+        self.assertLess(nav['erosion_prob'], 1)
+        
+        # Check confidence intervals
+        self.assertLess(nav['ci_lower'], nav['avg_nav'])
+        self.assertGreater(nav['ci_upper'], nav['avg_nav'])
+        
+        # Check paths
+        self.assertEqual(len(nav['nav_paths']), 100)
+    
+    def test_dilution_calculation(self):
+        """Test dilution calculations"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        dilution = result['dilution']
+        
+        # Basic checks
+        self.assertIsInstance(dilution['avg_dilution'], float)
+        self.assertGreaterEqual(dilution['avg_dilution'], 0)
+        self.assertLessEqual(dilution['avg_dilution'], 1)
+            
+    def test_convertible_value_calculation(self):
+        """Test convertible instrument valuation"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        convertible = result['convertible']
+        
+        # Basic checks
+        self.assertIsInstance(convertible['avg_convertible'], float)
+        self.assertGreaterEqual(convertible['avg_convertible'], 0)
+        
+        # CI checks (though in current implementation they're equal)
+        self.assertEqual(convertible['ci_lower'], convertible['avg_convertible'])
+        self.assertEqual(convertible['ci_upper'], convertible['avg_convertible'])
+    
+    def test_ltv_calculation(self):
+        """Test Loan-to-Value ratio calculations"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        ltv = result['ltv']
+        
+        # Basic checks
+        self.assertIsInstance(ltv['avg_ltv'], float)
+        self.assertGreaterEqual(ltv['avg_ltv'], 0)
+        
+        # Check confidence intervals
+        self.assertLess(ltv['ci_lower'], ltv['avg_ltv'])
+        self.assertGreater(ltv['ci_upper'], ltv['avg_ltv'])
+        
+        # Exceed probability should be between 0 and 1
+        self.assertGreaterEqual(ltv['exceed_prob'], 0)
+        self.assertLessEqual(ltv['exceed_prob'], 1)
+    
+    def test_roe_calculation(self):
+        """Test Return on Equity calculations"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        roe = result['roe']
+        
+        # Basic checks
+        self.assertIsInstance(roe['avg_roe'], float)
+        
+        # ROE should be greater than risk-free rate
+        self.assertGreater(roe['avg_roe'], self.params['risk_free_rate'])
+        
+        # Sharpe ratio should be positive
+        self.assertGreater(roe['sharpe'], 0)
+    
+    def test_term_sheet_generation(self):
+        """Test term sheet generation logic"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        term_sheet = result['term_sheet']
+        
+        # Check structure
+        expected_keys = [
+            'structure', 'amount', 'rate', 'term', 'ltv_cap',
+            'collateral', 'conversion_premium', 'btc_bought',
+            'total_btc_treasury', 'savings', 'roe_uplift'
+        ]
+        for key in expected_keys:
+            self.assertIn(key, term_sheet)
+        
+        # Check structure selection logic
+        if result['dilution']['avg_dilution'] < 0.1:
+            self.assertEqual(term_sheet['structure'], 'Convertible Note')
+        else:
+            self.assertEqual(term_sheet['structure'], 'BTC-Collateralized Loan')
+    
+    def test_business_impact_calculation(self):
+        """Test business impact metrics"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        impact = result['business_impact']
+        
+        # Basic checks
+        self.assertIsInstance(impact['savings'], float)
+        self.assertIsInstance(impact['roe_uplift'], float)
+        self.assertIsInstance(impact['reduced_risk'], float)
+        
+        # Reduced risk should match erosion probability
+        self.assertEqual(impact['reduced_risk'], result['nav']['erosion_prob'])
+    
+    def test_target_metrics(self):
+        """Test target metrics calculations"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        target = result['target_metrics']
+        
+        # Basic checks
+        self.assertIsInstance(target['target_nav'], float)
+        self.assertIsInstance(target['target_ltv'], float)
+        self.assertIsInstance(target['target_roe'], float)
+        
+        # Target LTV should be reasonable
+        self.assertGreater(target['target_ltv'], 0)
+        self.assertLess(target['target_ltv'], 1)
+    
+    def test_scenario_analysis(self):
+        """Test scenario analysis calculations"""
+        result = calculate_metrics(self.params, self.btc_prices, self.vol_heston)
+        scenarios = result['scenario_metrics']
+        
+        # Check all scenarios exist
+        expected_scenarios = ['Bull Case', 'Base Case', 'Bear Case', 'Stress Test']
+        for scenario in expected_scenarios:
+            self.assertIn(scenario, scenarios)
+        
+        # Check probabilities sum to approximately 1
+        total_prob = sum(scenarios[s]['probability'] for s in scenarios)
+        self.assertAlmostEqual(total_prob, 1.0, delta=0.1)
+        
+        # Check price multipliers are applied correctly
+        self.assertAlmostEqual(
+            scenarios['Bull Case']['btc_price'],
+            self.params['BTC_current_market_price'] * 1.5
+        )
+        self.assertAlmostEqual(
+            scenarios['Bear Case']['btc_price'],
+            self.params['BTC_current_market_price'] * 0.7
+        )
+    
+    def test_zero_volatility_edge_case(self):
+        """Test handling of zero volatility edge case"""
+        zero_vol = np.zeros_like(self.vol_heston)
+        with self.assertRaises(ZeroDivisionError):
+            calculate_metrics(self.params, self.btc_prices, zero_vol)
+    
+    def test_small_number_of_paths(self):
+        """Test with very small number of paths"""
+        small_prices = self.btc_prices[:10]
+        small_vol = self.vol_heston[:9]
+        result = calculate_metrics(self.params, small_prices, small_vol)
+        
+        # Should still return all metrics
+        self.assertIn('nav', result)
+        self.assertIn('dilution', result)
