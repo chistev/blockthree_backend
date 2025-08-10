@@ -98,8 +98,6 @@ def calculate_metrics(params, btc_prices, vol_heston):
                      for nav in nav_paths_temp]
     avg_dilution = np.mean(dilution_paths)
     nav_paths = [nav - avg_dilution for nav in nav_paths_temp]
-    NAV = (CollateralValue_t + CollateralValue_t * params['delta'] - params['LoanPrincipal'] * params['cost_of_debt'] - avg_dilution) / (params['initial_equity_value'] + params['new_equity_raised'])
-    
     avg_nav = np.mean(nav_paths)
     ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(params['paths'])
     erosion_prob = np.mean(np.array(nav_paths) < 0.9 * avg_nav)
@@ -175,6 +173,46 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'target_bundle_value': target_bundle_value
     }
     
+    # Scenario Analysis
+    scenarios = {
+        'Bull Case': {'price_multiplier': 1.5, 'probability': 0.25},
+        'Base Case': {'price_multiplier': 1.0, 'probability': 0.40},
+        'Bear Case': {'price_multiplier': 0.7, 'probability': 0.25},
+        'Stress Test': {'price_multiplier': 0.4, 'probability': 0.10}
+    }
+
+    scenario_metrics = {}
+    for scenario_name, config in scenarios.items():
+        price_multiplier = config['price_multiplier']
+        probability = config['probability']
+        
+        # Calculate scenario-specific BTC price
+        scenario_btc_price = params['BTC_current_market_price'] * price_multiplier
+        scenario_collateral_value = total_btc * scenario_btc_price
+        scenario_nav = (scenario_collateral_value + scenario_collateral_value * params['delta'] - 
+                       params['LoanPrincipal'] * params['cost_of_debt'] - avg_dilution) / \
+                       (params['initial_equity_value'] + params['new_equity_raised'])
+        scenario_ltv = params['LoanPrincipal'] / (total_btc * scenario_btc_price)
+        
+        # Calculate NAV impact relative to average NAV
+        nav_impact = ((scenario_nav - avg_nav) / avg_nav) * 100 if avg_nav != 0 else 0
+        
+        # Estimate probability of scenario based on simulated paths
+        price_threshold = params['BTC_current_market_price'] * price_multiplier
+        if scenario_name == 'Bull Case':
+            scenario_prob = np.mean(btc_prices >= price_threshold)
+        elif scenario_name == 'Bear Case' or scenario_name == 'Stress Test':
+            scenario_prob = np.mean(btc_prices <= price_threshold)
+        else:  # Base Case
+            scenario_prob = probability  # Use default probability for Base Case
+        
+        scenario_metrics[scenario_name] = {
+            'btc_price': scenario_btc_price,
+            'nav_impact': nav_impact,
+            'ltv_ratio': scenario_ltv,
+            'probability': scenario_prob
+        }
+
     return {
         'nav': {'avg_nav': avg_nav, 'ci_lower': avg_nav - ci_nav, 'ci_upper': avg_nav + ci_nav, 
                 'erosion_prob': erosion_prob, 'nav_paths': nav_paths[:100]},
@@ -187,14 +225,19 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'preferred_bundle': {'bundle_value': bundle_value, 'ci_lower': bundle_value * 0.98, 'ci_upper': bundle_value * 1.02},
         'term_sheet': term_sheet,
         'business_impact': business_impact,
-        'target_metrics': target_metrics
+        'target_metrics': target_metrics,
+        'scenario_metrics': scenario_metrics  # Add scenario metrics to response
     }
 
 def generate_csv_response(metrics):
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(['Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV', 'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
-                     'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury'])
+                     'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury',
+                     'Bull Case BTC Price', 'Bull Case NAV Impact', 'Bull Case LTV', 'Bull Case Probability',
+                     'Base Case BTC Price', 'Base Case NAV Impact', 'Base Case LTV', 'Base Case Probability',
+                     'Bear Case BTC Price', 'Bear Case NAV Impact', 'Bear Case LTV', 'Bear Case Probability',
+                     'Stress Test BTC Price', 'Stress Test NAV Impact', 'Stress Test LTV', 'Stress Test Probability'])
     writer.writerow([f"{metrics['nav']['avg_nav']:.2f}", f"{metrics['target_metrics']['target_nav']:.2f}",
                      f"{metrics['dilution']['avg_dilution']:.4f}",
                      f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['target_metrics']['target_ltv']:.4f}",
@@ -202,7 +245,23 @@ def generate_csv_response(metrics):
                      f"{metrics['preferred_bundle']['bundle_value']:.2f}", f"{metrics['target_metrics']['target_bundle_value']:.2f}",
                      metrics['term_sheet']['structure'], f"{metrics['term_sheet']['amount']:.2f}",
                      f"{metrics['term_sheet']['rate']:.4f}", f"{metrics['term_sheet']['btc_bought']:.2f}",
-                     f"{metrics['term_sheet']['total_btc_treasury']:.2f}"])
+                     f"{metrics['term_sheet']['total_btc_treasury']:.2f}",
+                     f"{metrics['scenario_metrics']['Bull Case']['btc_price']:.2f}",
+                     f"{metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
+                     f"{metrics['scenario_metrics']['Bull Case']['ltv_ratio']:.4f}",
+                     f"{metrics['scenario_metrics']['Bull Case']['probability']:.2f}",
+                     f"{metrics['scenario_metrics']['Base Case']['btc_price']:.2f}",
+                     f"{metrics['scenario_metrics']['Base Case']['nav_impact']:.2f}%",
+                     f"{metrics['scenario_metrics']['Base Case']['ltv_ratio']:.4f}",
+                     f"{metrics['scenario_metrics']['Base Case']['probability']:.2f}",
+                     f"{metrics['scenario_metrics']['Bear Case']['btc_price']:.2f}",
+                     f"{metrics['scenario_metrics']['Bear Case']['nav_impact']:.2f}%",
+                     f"{metrics['scenario_metrics']['Bear Case']['ltv_ratio']:.4f}",
+                     f"{metrics['scenario_metrics']['Bear Case']['probability']:.2f}",
+                     f"{metrics['scenario_metrics']['Stress Test']['btc_price']:.2f}",
+                     f"{metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%",
+                     f"{metrics['scenario_metrics']['Stress Test']['ltv_ratio']:.4f}",
+                     f"{metrics['scenario_metrics']['Stress Test']['probability']:.2f}"])
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="metrics.csv"'
     response.write(output.getvalue().encode('utf-8'))
@@ -231,12 +290,32 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Term Amount: {metrics['term_sheet']['amount']:.2f}",
         f"Term Rate: {metrics['term_sheet']['rate']:.4f}",
         f"BTC Bought: {metrics['term_sheet']['btc_bought']:.2f}",
-        f"Total BTC Treasury: {metrics['term_sheet']['total_btc_treasury']:.2f}"
+        f"Total BTC Treasury: {metrics['term_sheet']['total_btc_treasury']:.2f}",
+        f"Bull Case BTC Price: ${metrics['scenario_metrics']['Bull Case']['btc_price']:.2f}",
+        f"Bull Case NAV Impact: {metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
+        f"Bull Case LTV: {metrics['scenario_metrics']['Bull Case']['ltv_ratio']:.4f}",
+        f"Bull Case Probability: {metrics['scenario_metrics']['Bull Case']['probability']:.2f}",
+        f"Base Case BTC Price: ${metrics['scenario_metrics']['Base Case']['btc_price']:.2f}",
+        f"Base Case NAV Impact: {metrics['scenario_metrics']['Base Case']['nav_impact']:.2f}%",
+        f"Base Case LTV: {metrics['scenario_metrics']['Base Case']['ltv_ratio']:.4f}",
+        f"Base Case Probability: {metrics['scenario_metrics']['Base Case']['probability']:.2f}",
+        f"Bear Case BTC Price: ${metrics['scenario_metrics']['Bear Case']['btc_price']:.2f}",
+        f"Bear Case NAV Impact: {metrics['scenario_metrics']['Bear Case']['nav_impact']:.2f}%",
+        f"Bear Case LTV: {metrics['scenario_metrics']['Bear Case']['ltv_ratio']:.4f}",
+        f"Bear Case Probability: {metrics['scenario_metrics']['Bear Case']['probability']:.2f}",
+        f"Stress Test BTC Price: ${metrics['scenario_metrics']['Stress Test']['btc_price']:.2f}",
+        f"Stress Test NAV Impact: {metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%",
+        f"Stress Test LTV: {metrics['scenario_metrics']['Stress Test']['ltv_ratio']:.4f}",
+        f"Stress Test Probability: {metrics['scenario_metrics']['Stress Test']['probability']:.2f}"
     ]
     
     for item in items:
         c.drawString(100, y, item)
         y -= 20
+        if y < 50:  # Handle page overflow
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y = 750
     
     c.showPage()
     c.save()
@@ -276,7 +355,7 @@ def calculate(request):
         error_response = f"Error: {str(e)}"
         if params.get('export_format') == 'csv':
             return HttpResponse(error_response, content_type='text/plain', status=400)
-        elif params['export_format'] == 'pdf':
+        elif params.get('export_format') == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
 
@@ -340,7 +419,7 @@ def what_if(request):
         error_response = f"Error: {str(e)}"
         if params.get('export_format') == 'csv':
             return HttpResponse(error_response, content_type='text/plain', status=400)
-        elif params['export_format'] == 'pdf':
+        elif params.get('export_format') == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
 
