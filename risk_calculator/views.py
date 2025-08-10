@@ -345,6 +345,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
 @csrf_exempt
 @require_POST
 def calculate(request):
+    params = {}  # ensure it's always defined
     try:
         data = get_json_data(request)
         params = {k: float(data.get('assumptions', {}).get(k, v)) if k != 'paths' else int(data.get('assumptions', {}).get(k, v)) 
@@ -369,9 +370,10 @@ def calculate(request):
     
     except Exception as e:
         error_response = f"Error: {str(e)}"
-        if params.get('export_format') == 'csv':
+        export_format = params.get('export_format', 'json')
+        if export_format == 'csv':
             return HttpResponse(error_response, content_type='text/plain', status=400)
-        elif params.get('export_format') == 'pdf':
+        elif export_format == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
 
