@@ -12,10 +12,10 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
 DEFAULT_PARAMS = {
-    'BTC_treasury': 1000,  # Initial BTC in treasury
-    'BTC_purchased': 0,    # BTC purchased with loan proceeds
+    'BTC_treasury': 1000,
+    'BTC_purchased': 0,
     'BTC_current_market_price': 117000,
-    'targetBTCPrice': 117000,       # Target BTC price (new default)
+    'targetBTCPrice': 117000,
     'mu': 0.45,
     'sigma': 0.55,
     't': 1,
@@ -59,31 +59,55 @@ def validate_inputs(params):
 
 def simulate_btc_paths(params):
     dt = params['t'] / params['paths']
+    
+    # Adjust drift using Bayesian estimate and jump component
     mu_bayes = 0.5 * params['mu'] + 0.5 * 0.4
-    mu_adj = mu_bayes - params['jump_intensity'] * (np.exp(params['jump_mean'] + 0.5 * params['jump_volatility']**2) - 1)
-    
-    # Adjust drift to target targetBTCPrice
-    initial_equity_value = params['BTC_treasury'] * params['BTC_current_market_price']  # Initial portfolio value
-    S_T = params['BTC_treasury'] * params['targetBTCPrice']  # Target portfolio value at time t
-    drift_to_target = (np.log(S_T / initial_equity_value) / params['t']) - (0.5 * params['sigma']**2)  # Adjusted drift to hit targetBTCPrice
-    mu_adj = 0.7 * mu_adj + 0.3 * drift_to_target  # Blend Bayesian drift with target drift
-    
-    # Generate initial paths for GARCH volatility
-    btc_returns_init = np.random.normal(loc=mu_adj * dt, scale=params['sigma'] * np.sqrt(dt), size=params['paths'])
+    mu_adj = mu_bayes - params['jump_intensity'] * (
+        np.exp(params['jump_mean'] + 0.5 * params['jump_volatility']**2) - 1
+    )
+
+    # Adjust drift to target price
+    initial_equity_value = params['BTC_treasury'] * params['BTC_current_market_price']
+    S_T = params['BTC_treasury'] * params['targetBTCPrice']
+    drift_to_target = (
+        np.log(S_T / initial_equity_value) / params['t']
+    ) - (0.5 * params['sigma']**2)
+
+    mu_adj = 0.7 * mu_adj + 0.3 * drift_to_target
+
+    # Initial return simulation
+    btc_returns_init = np.random.normal(
+        loc=mu_adj * dt,
+        scale=params['sigma'] * np.sqrt(dt),
+        size=params['paths']
+    )
     btc_prices_init = params['BTC_treasury'] * np.exp(np.cumsum(btc_returns_init))
+
+    # Log returns for GARCH model
     log_returns = np.log(btc_prices_init[1:] / btc_prices_init[:-1]) * 100
     garch_model = arch_model(log_returns, p=1, q=1)
     garch_fit = garch_model.fit(disp='off')
     vol_garch = garch_fit.conditional_volatility / 100
-    vol_heston = params['long_run_volatility'] + (params['sigma'] - params['long_run_volatility']) * np.exp(-params['vol_mean_reversion_speed'] * np.linspace(0, params['t'], len(vol_garch))) + vol_garch
 
-    # Generate final paths with adjusted drift
+    # Combine GARCH with Heston-like volatility model
+    time_grid = np.linspace(0, params['t'], len(vol_garch))
+    vol_heston = (
+        params['long_run_volatility'] +
+        (params['sigma'] - params['long_run_volatility']) *
+        np.exp(-params['vol_mean_reversion_speed'] * time_grid) +
+        vol_garch
+    )
+
+    # Final return simulation with jumps
     btc_returns = np.zeros(params['paths'])
     for i in range(params['paths']):
-        btc_returns[i] = np.random.normal(loc=mu_adj * dt, scale=vol_heston[min(i, len(vol_heston)-1)] * np.sqrt(dt))
+        vol = vol_heston[min(i, len(vol_heston) - 1)]
+        btc_returns[i] = np.random.normal(loc=mu_adj * dt, scale=vol * np.sqrt(dt))
         if np.random.random() < params['jump_intensity'] * dt:
             btc_returns[i] += np.random.normal(params['jump_mean'], params['jump_volatility'])
+
     btc_prices = params['BTC_treasury'] * np.exp(np.cumsum(btc_returns))
+    
     return btc_prices, vol_heston
 
 def calculate_metrics(params, btc_prices, vol_heston):
@@ -153,7 +177,6 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'reduced_risk': erosion_prob
     }
     
-    # Target scenario (using targetBTCPrice)
     target_btc_price = params['targetBTCPrice']
     target_collateral_value = total_btc * target_btc_price
     target_nav = (target_collateral_value + target_collateral_value * params['delta'] - params['LoanPrincipal'] * params['cost_of_debt'] - avg_dilution) / (params['initial_equity_value'] + params['new_equity_raised'])
@@ -173,7 +196,6 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'target_bundle_value': target_bundle_value
     }
     
-    # Scenario Analysis
     scenarios = {
         'Bull Case': {'price_multiplier': 1.5, 'probability': 0.25},
         'Base Case': {'price_multiplier': 1.0, 'probability': 0.40},
@@ -185,27 +207,20 @@ def calculate_metrics(params, btc_prices, vol_heston):
     for scenario_name, config in scenarios.items():
         price_multiplier = config['price_multiplier']
         probability = config['probability']
-        
-        # Calculate scenario-specific BTC price
         scenario_btc_price = params['BTC_current_market_price'] * price_multiplier
         scenario_collateral_value = total_btc * scenario_btc_price
         scenario_nav = (scenario_collateral_value + scenario_collateral_value * params['delta'] - 
                        params['LoanPrincipal'] * params['cost_of_debt'] - avg_dilution) / \
                        (params['initial_equity_value'] + params['new_equity_raised'])
         scenario_ltv = params['LoanPrincipal'] / (total_btc * scenario_btc_price)
-        
-        # Calculate NAV impact relative to average NAV
         nav_impact = ((scenario_nav - avg_nav) / avg_nav) * 100 if avg_nav != 0 else 0
-        
-        # Estimate probability of scenario based on simulated paths
         price_threshold = params['BTC_current_market_price'] * price_multiplier
         if scenario_name == 'Bull Case':
             scenario_prob = np.mean(btc_prices >= price_threshold)
         elif scenario_name == 'Bear Case' or scenario_name == 'Stress Test':
             scenario_prob = np.mean(btc_prices <= price_threshold)
-        else:  # Base Case
-            scenario_prob = probability  # Use default probability for Base Case
-        
+        else:
+            scenario_prob = probability
         scenario_metrics[scenario_name] = {
             'btc_price': scenario_btc_price,
             'nav_impact': nav_impact,
@@ -213,7 +228,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
             'probability': scenario_prob
         }
 
-    return {
+    response_data = {
         'nav': {'avg_nav': avg_nav, 'ci_lower': avg_nav - ci_nav, 'ci_upper': avg_nav + ci_nav, 
                 'erosion_prob': erosion_prob, 'nav_paths': nav_paths[:100]},
         'dilution': {'base_dilution': base_dilution, 'avg_dilution': avg_dilution, 
@@ -226,8 +241,9 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'term_sheet': term_sheet,
         'business_impact': business_impact,
         'target_metrics': target_metrics,
-        'scenario_metrics': scenario_metrics  # Add scenario metrics to response
+        'scenario_metrics': scenario_metrics
     }
+    return response_data
 
 def generate_csv_response(metrics):
     output = StringIO()
@@ -312,7 +328,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
     for item in items:
         c.drawString(100, y, item)
         y -= 20
-        if y < 50:  # Handle page overflow
+        if y < 50:
             c.showPage()
             c.setFont("Helvetica", 12)
             y = 750
@@ -373,12 +389,20 @@ def what_if(request):
         params['use_live'] = data.get('use_live', False)
         params['targetBTCPrice'] = float(assumptions.get('targetBTCPrice', DEFAULT_PARAMS['targetBTCPrice']))
         
+        if not param or not value:
+            raise ValueError("Both 'param' and 'value' must be provided")
+        if param not in DEFAULT_PARAMS and param not in ['LTV_Cap', 'beta_ROE']:
+            raise ValueError(f"Invalid parameter: {param}")
+        if value not in ['optimize', 'maximize'] and not isinstance(value, (int, float, str)):
+            raise ValueError(f"Invalid value for parameter {param}: {value}")
+        
         validate_inputs(params)
         if params['use_live']:
             btc_price = fetch_btc_price()
             if btc_price:
                 params['BTC_current_market_price'] = btc_price
         
+        optimized_param = None
         if param == 'LTV_Cap' and value == 'optimize':
             best_ltv = 0.5
             min_prob = 1.0
@@ -393,6 +417,7 @@ def what_if(request):
                     min_prob = prob
                     best_ltv = ltv
             params['LTV_Cap'] = 0.5 if min_prob < 0.15 else best_ltv
+            optimized_param = {'LTV_Cap': params['LTV_Cap']}
         elif param == 'beta_ROE' and value == 'maximize':
             btc_prices, vol_heston = simulate_btc_paths(params)
             best_beta = 2.5
@@ -403,11 +428,17 @@ def what_if(request):
                     max_roe = np.mean(roe_t)
                     best_beta = beta
             params['beta_ROE'] = best_beta
+            optimized_param = {'beta_ROE': params['beta_ROE']}
         else:
-            params[param] = float(value)
+            try:
+                params[param] = float(value)
+            except ValueError:
+                raise ValueError(f"Value for {param} must be a number, got {value}")
         
         btc_prices, vol_heston = simulate_btc_paths(params)
         response_data = calculate_metrics(params, btc_prices, vol_heston)
+        if optimized_param:
+            response_data['optimized_param'] = optimized_param
         
         if params['export_format'] == 'csv':
             return generate_csv_response(response_data)
