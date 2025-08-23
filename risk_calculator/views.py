@@ -10,6 +10,10 @@ import csv
 from io import StringIO, BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 DEFAULT_PARAMS = {
     'BTC_treasury': 1000,
@@ -44,9 +48,11 @@ def get_json_data(request):
 def fetch_btc_price():
     try:
         response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd')
-        return response.json()['bitcoin']['usd']
+        btc_price = response.json()['bitcoin']['usd']
+        logger.info(f"Fetched BTC price: {btc_price}")
+        return btc_price
     except Exception as e:
-        print(f"Live BTC price fetch failed: {str(e)}")
+        logger.error(f"Live BTC price fetch failed: {str(e)}")
         return None
 
 def validate_inputs(params):
@@ -56,8 +62,11 @@ def validate_inputs(params):
         raise ValueError("initial_equity_value, BTC_current_market_price, BTC_treasury, and targetBTCPrice must be positive")
     if params['BTC_purchased'] < 0:
         raise ValueError("BTC_purchased cannot be negative")
+    if params['paths'] < 1:
+        raise ValueError("paths must be at least 1")
 
-def simulate_btc_paths(params):
+def simulate_btc_paths(params, seed=42):
+    np.random.seed(seed) 
     dt = params['t'] / params['paths']
     
     # Adjust drift using Bayesian estimate and jump component
@@ -74,6 +83,7 @@ def simulate_btc_paths(params):
     ) - (0.5 * params['sigma']**2)
 
     mu_adj = 0.7 * mu_adj + 0.3 * drift_to_target
+    logger.info(f"Adjusted drift: {mu_adj}")
 
     # Initial return simulation
     btc_returns_init = np.random.normal(
@@ -85,9 +95,10 @@ def simulate_btc_paths(params):
 
     # Log returns for GARCH model
     log_returns = np.log(btc_prices_init[1:] / btc_prices_init[:-1]) * 100
-    garch_model = arch_model(log_returns, p=1, q=1)
-    garch_fit = garch_model.fit(disp='off')
+    garch_model = arch_model(log_returns, p=1, q=1, mean='Zero', vol='GARCH')
+    garch_fit = garch_model.fit(disp='off', options={'maxiter': 100})
     vol_garch = garch_fit.conditional_volatility / 100
+    logger.info(f"GARCH volatility mean: {np.mean(vol_garch)}")
 
     # Combine GARCH with Heston-like volatility model
     time_grid = np.linspace(0, params['t'], len(vol_garch))
@@ -107,6 +118,7 @@ def simulate_btc_paths(params):
             btc_returns[i] += np.random.normal(params['jump_mean'], params['jump_volatility'])
 
     btc_prices = params['BTC_treasury'] * np.exp(np.cumsum(btc_returns))
+    logger.info(f"Simulated BTC price mean: {np.mean(btc_prices)}")
     
     return btc_prices, vol_heston
 
@@ -139,10 +151,10 @@ def calculate_metrics(params, btc_prices, vol_heston):
     ci_ltv = 1.96 * np.std(ltv_paths) / np.sqrt(params['paths'])
     exceed_prob = np.mean(np.array(ltv_paths) > params['LTV_Cap'])
     
-    roe_t = params['risk_free_rate'] + params['beta_ROE'] * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_heston / params['long_run_volatility'])
+    roe_t = params['risk_free_rate'] + params['beta_ROE'] * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_heston[-1] / params['long_run_volatility'])
     avg_roe = np.mean(roe_t)
     ci_roe = 1.96 * np.std(roe_t) / np.sqrt(params['paths'])
-    sharpe = (avg_roe - params['risk_free_rate']) / np.std(roe_t)
+    sharpe = (avg_roe - params['risk_free_rate']) / np.std(roe_t) if np.std(roe_t) != 0 else 0
     
     tax_rate = 0.2
     bundle_value = (0.4 * avg_nav + 0.3 * avg_dilution + 0.3 * convertible_value) * (1 - tax_rate)
@@ -151,7 +163,6 @@ def calculate_metrics(params, btc_prices, vol_heston):
     optimized_rate = params['risk_free_rate'] + 0.02 * (params['sigma'] / params['long_run_volatility'])
     optimized_amount = CollateralValue_t * optimized_ltv
     optimized_btc = optimized_amount / params['BTC_current_market_price']
-    params['BTC_purchased'] = optimized_btc
     adjusted_savings = (base_dilution * params['initial_equity_value'] * params['BTC_current_market_price']) - avg_dilution
     roe_uplift = avg_roe - (params['expected_return_btc'] * params['beta_ROE'])
     kept_money = adjusted_savings + roe_uplift * params['initial_equity_value'] * params['BTC_current_market_price']
@@ -243,6 +254,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'target_metrics': target_metrics,
         'scenario_metrics': scenario_metrics
     }
+    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}")
     return response_data
 
 def generate_csv_response(metrics):
@@ -348,29 +360,70 @@ def calculate(request):
     params = {}  # ensure it's always defined
     try:
         data = get_json_data(request)
-        params = {k: float(data.get('assumptions', {}).get(k, v)) if k != 'paths' else int(data.get('assumptions', {}).get(k, v)) 
+        # Create initial parameters from user input, defaulting to DEFAULT_PARAMS
+        initial_params = {k: float(data.get('assumptions', {}).get(k, v)) if k != 'paths' else int(data.get('assumptions', {}).get(k, v)) 
                   for k, v in DEFAULT_PARAMS.items()}
-        params['export_format'] = data.get('format', 'json').lower()
-        params['use_live'] = data.get('use_live', False)
+        initial_params['export_format'] = data.get('format', 'json').lower()
+        initial_params['use_live'] = data.get('use_live', False)
         
-        validate_inputs(params)
-        if params['use_live']:
+        validate_inputs(initial_params)
+        if initial_params['use_live']:
             btc_price = fetch_btc_price()
             if btc_price:
-                params['BTC_current_market_price'] = btc_price
+                initial_params['BTC_current_market_price'] = btc_price
+                # Only update target price if it was the default
+                if initial_params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
+                    initial_params['targetBTCPrice'] = btc_price
+
+        # PASS 1: Run simulation with user's initial inputs to GENERATE ADVICE
+        logger.info("--- Starting Pass 1 (Generate Advice) ---")
+        btc_prices_pass1, vol_heston_pass1 = simulate_btc_paths(initial_params)
+        response_data_pass1 = calculate_metrics(initial_params, btc_prices_pass1, vol_heston_pass1)
         
-        btc_prices, vol_heston = simulate_btc_paths(params)
-        response_data = calculate_metrics(params, btc_prices, vol_heston)
+        # Extract the optimized advice from the first pass
+        optimized_advice = response_data_pass1['term_sheet']
+        optimized_loan_amount = optimized_advice['amount']
+        optimized_btc_to_buy = optimized_advice['btc_bought']
+        optimized_loan_rate = optimized_advice['rate']
         
-        if params['export_format'] == 'csv':
-            return generate_csv_response(response_data)
-        elif params['export_format'] == 'pdf':
-            return generate_pdf_response(response_data)
-        return JsonResponse(response_data)
+        logger.info(f"Pass 1 Advice: Borrow ${optimized_loan_amount:.2f} at {optimized_loan_rate:.4%} to buy {optimized_btc_to_buy:.2f} BTC")
+
+        # PASS 2: Run simulation AGAIN, using the advice from Pass 1 to create a stable state
+        logger.info("--- Starting Pass 2 (Project Stable State) ---")
+        # Create a new copy of parameters for the second pass
+        stable_state_params = initial_params.copy()
+        # UPDATE THE PARAMETERS WITH THE ADVICE FROM PASS 1
+        stable_state_params['LoanPrincipal'] = optimized_loan_amount
+        stable_state_params['cost_of_debt'] = optimized_loan_rate
+        stable_state_params['BTC_purchased'] = optimized_btc_to_buy # This is the key change
+
+        # Re-run simulation with the new, stable state parameters
+        btc_prices_pass2, vol_heston_pass2 = simulate_btc_paths(stable_state_params)
+        # Calculate metrics for the stable state (AFTER following the advice)
+        response_data_pass2 = calculate_metrics(stable_state_params, btc_prices_pass2, vol_heston_pass2)
+
+        # COMBINE THE RESULTS FOR THE FINAL REPORT:
+        # Use the METRICS from the stable state (Pass 2)
+        final_response_data = response_data_pass2
+        # But use the TERM SHEET (advice) from the initial analysis (Pass 1)
+        final_response_data['term_sheet'] = optimized_advice
+        
+        logger.info("--- Final Report Generated ---")
+        logger.info(f"Final NAV: {final_response_data['nav']['avg_nav']:.2f}")
+        logger.info(f"Final LTV: {final_response_data['ltv']['avg_ltv']:.4f}")
+        logger.info(f"Term Advice: Borrow ${final_response_data['term_sheet']['amount']:.2f}")
+
+        # Generate the requested export format
+        if initial_params['export_format'] == 'csv':
+            return generate_csv_response(final_response_data)
+        elif initial_params['export_format'] == 'pdf':
+            return generate_pdf_response(final_response_data)
+        return JsonResponse(final_response_data)
     
     except Exception as e:
+        logger.error(f"Calculate endpoint error: {str(e)}")
         error_response = f"Error: {str(e)}"
-        export_format = params.get('export_format', 'json')
+        export_format = params.get('export_format', 'json') if 'params' in locals() else 'json'
         if export_format == 'csv':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         elif export_format == 'pdf':
@@ -389,7 +442,6 @@ def what_if(request):
                   for k, v in DEFAULT_PARAMS.items()}
         params['export_format'] = data.get('format', 'json').lower()
         params['use_live'] = data.get('use_live', False)
-        params['targetBTCPrice'] = float(assumptions.get('targetBTCPrice', DEFAULT_PARAMS['targetBTCPrice']))
         
         if not param or not value:
             raise ValueError("Both 'param' and 'value' must be provided")
@@ -403,6 +455,7 @@ def what_if(request):
             btc_price = fetch_btc_price()
             if btc_price:
                 params['BTC_current_market_price'] = btc_price
+                params['targetBTCPrice'] = btc_price if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice'] else params['targetBTCPrice']
         
         optimized_param = None
         if param == 'LTV_Cap' and value == 'optimize':
@@ -411,8 +464,9 @@ def what_if(request):
             total_btc = params['BTC_treasury'] + params['BTC_purchased']
             CollateralValue_t = total_btc * params['BTC_current_market_price']
             dt = params['t'] / params['paths']
+            np.random.seed(42)  # Consistent seed for optimization
             for ltv in np.arange(0.1, 0.9, 0.05):
-                jumps = levy_stable.rvs(alpha=1.5, beta=0, size=params['paths']) * 0.15 * dt
+                jumps = levy_stable.rvs(alpha=1.5, beta=0, size=params['paths'], random_state=42) * 0.15 * dt
                 ltv_t = params['LoanPrincipal'] / (CollateralValue_t * np.cumprod(1 + np.random.normal(params['mu'], params['sigma'], params['paths']) * dt - 0.01 * jumps))
                 prob = np.mean(ltv_t > ltv)
                 if prob < min_prob:
@@ -420,23 +474,27 @@ def what_if(request):
                     best_ltv = ltv
             params['LTV_Cap'] = 0.5 if min_prob < 0.15 else best_ltv
             optimized_param = {'LTV_Cap': params['LTV_Cap']}
+            logger.info(f"Optimized LTV_Cap: {params['LTV_Cap']}")
         elif param == 'beta_ROE' and value == 'maximize':
             btc_prices, vol_heston = simulate_btc_paths(params)
             best_beta = 2.5
             max_roe = 0.0
+            np.random.seed(42)  # Consistent seed for optimization
             for beta in np.arange(1.0, 3.0, 0.1):
-                roe_t = params['risk_free_rate'] + beta * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_heston / params['long_run_volatility'])
+                roe_t = params['risk_free_rate'] + beta * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_heston[-1] / params['long_run_volatility'])
                 if np.mean(roe_t) > max_roe:
                     max_roe = np.mean(roe_t)
                     best_beta = beta
             params['beta_ROE'] = best_beta
             optimized_param = {'beta_ROE': params['beta_ROE']}
+            logger.info(f"Optimized beta_ROE: {params['beta_ROE']}")
         else:
             try:
                 params[param] = float(value)
             except ValueError:
                 raise ValueError(f"Value for {param} must be a number, got {value}")
         
+        # Update params with optimized term sheet values if available
         btc_prices, vol_heston = simulate_btc_paths(params)
         response_data = calculate_metrics(params, btc_prices, vol_heston)
         if optimized_param:
@@ -449,10 +507,12 @@ def what_if(request):
         return JsonResponse(response_data)
     
     except Exception as e:
+        logger.error(f"What-If endpoint error: {str(e)}")
         error_response = f"Error: {str(e)}"
-        if params.get('export_format') == 'csv':
+        export_format = params.get('export_format', 'json')
+        if export_format == 'csv':
             return HttpResponse(error_response, content_type='text/plain', status=400)
-        elif params.get('export_format') == 'pdf':
+        elif export_format == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
 
@@ -464,4 +524,5 @@ def get_btc_price(request):
             return JsonResponse({'error': 'Failed to fetch live BTC price'}, status=500)
         return JsonResponse({'BTC_current_market_price': btc_price})
     except Exception as e:
+        logger.error(f"Get BTC price error: {str(e)}")
         return JsonResponse({'error': str(e)}, status=500)
