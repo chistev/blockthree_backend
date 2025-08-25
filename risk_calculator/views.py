@@ -2,7 +2,7 @@ from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt
 import numpy as np
-from scipy.stats import norm, levy_stable
+from scipy.stats import norm
 from scipy.optimize import minimize, minimize_scalar
 from arch import arch_model
 import requests
@@ -325,13 +325,6 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
         (0, params['initial_equity_value'] * 3),  # LoanPrincipal bounds
         (params['risk_free_rate'], params['risk_free_rate'] + 0.15),  # cost_of_debt bounds
         (0.1, 0.8)  # LTV_Cap bounds
-    ]
-    
-    # Constraints for optimization
-    constraints = [
-        {'type': 'ineq', 'fun': lambda x: params['min_profit_margin'] - 
-         calculate_metrics({**params, 'LoanPrincipal': x[0], 'cost_of_debt': x[1], 'LTV_Cap': x[2]}, 
-                          btc_prices, vol_heston)['term_sheet']['profit_margin']}
     ]
     
     try:
@@ -701,3 +694,4 @@ def get_btc_price(request):
     except Exception as e:
         logger.error(f"Get BTC price error: {str(e)}")
         return JsonResponse({'error': str(e)}, status=500)
+    
