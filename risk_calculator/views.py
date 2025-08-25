@@ -3,7 +3,7 @@ from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt
 import numpy as np
 from scipy.stats import norm, levy_stable
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 from arch import arch_model
 import requests
 import json
@@ -267,8 +267,9 @@ def calculate_metrics(params, btc_prices, vol_heston):
 
 def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
     """
-    Optimize for maximum BTC purchase and ROE uplift while minimizing dilution,
-    erosion probability, and LTV exceedance probability with a profit margin constraint
+    Optimize for corporate treasury objectives: maximize BTC purchase and ROE uplift
+    while minimizing dilution, erosion probability, and LTV exceedance probability
+    with profit margin constraint
     """
     logger.info("Starting optimization for corporate treasury objectives")
     
@@ -280,63 +281,83 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
         temp_params['cost_of_debt'] = x[1]
         temp_params['LTV_Cap'] = x[2]
         
-        # Calculate metrics with these parameters
-        metrics = calculate_metrics(temp_params, btc_prices, vol_heston)
-        
-        # Calculate BTC that could be purchased
-        btc_purchasable = x[0] / params['BTC_current_market_price']
-        
-        # Weights for different objectives (can be adjusted)
-        w_btc = 0.4  # Weight for BTC purchase (maximize)
-        w_roe = 0.3  # Weight for ROE uplift (maximize)
-        w_dilution = -0.1  # Weight for dilution (minimize)
-        w_erosion = -0.1  # Weight for erosion probability (minimize)
-        w_ltv = -0.1  # Weight for LTV exceedance probability (minimize)
-        
-        # Calculate objective value
-        objective_value = (
-            w_btc * btc_purchasable +
-            w_roe * metrics['business_impact']['roe_uplift'] +
-            w_dilution * metrics['dilution']['avg_dilution'] +
-            w_erosion * metrics['nav']['erosion_prob'] +
-            w_ltv * metrics['ltv']['exceed_prob']
-        )
-        
-        # Add penalty if profit margin is below minimum
-        profit_margin = metrics['term_sheet']['profit_margin']
-        if profit_margin < params['min_profit_margin']:
-            objective_value -= 1000 * (params['min_profit_margin'] - profit_margin)
+        try:
+            # Calculate metrics with these parameters
+            metrics = calculate_metrics(temp_params, btc_prices, vol_heston)
             
-        return -objective_value  # Negative because we're minimizing
+            # Calculate BTC that could be purchased
+            btc_purchasable = x[0] / params['BTC_current_market_price']
+            
+            # Weights for different objectives (adjust based on treasury priorities)
+            w_btc = 0.4  # Weight for BTC purchase (maximize)
+            w_roe = 0.3  # Weight for ROE uplift (maximize)
+            w_dilution = -0.1  # Weight for dilution (minimize)
+            w_erosion = -0.1  # Weight for erosion probability (minimize)
+            w_ltv = -0.1  # Weight for LTV exceedance probability (minimize)
+            w_profit = 0.3  # Weight for profit margin (maximize)
+            
+            # Calculate objective value
+            objective_value = (
+                w_btc * btc_purchasable +
+                w_roe * metrics['business_impact']['roe_uplift'] +
+                w_dilution * metrics['dilution']['avg_dilution'] +
+                w_erosion * metrics['nav']['erosion_prob'] +
+                w_ltv * metrics['ltv']['exceed_prob'] +
+                w_profit * metrics['term_sheet']['profit_margin']
+            )
+            
+            # Add penalty if profit margin is below minimum
+            profit_margin = metrics['term_sheet']['profit_margin']
+            if profit_margin < params['min_profit_margin']:
+                objective_value -= 1000 * (params['min_profit_margin'] - profit_margin)
+                
+            return -objective_value  # Negative because we're minimizing
+            
+        except Exception as e:
+            logger.error(f"Objective function error: {str(e)}")
+            return float('inf')  # Return a very bad score if calculation fails
     
     # Initial guess (current parameters)
     x0 = np.array([params['LoanPrincipal'], params['cost_of_debt'], params['LTV_Cap']])
     
     # Bounds for parameters
     bounds = [
-        (0, params['initial_equity_value'] * 2),  # LoanPrincipal bounds
-        (params['risk_free_rate'], params['risk_free_rate'] + 0.1),  # cost_of_debt bounds
+        (0, params['initial_equity_value'] * 3),  # LoanPrincipal bounds
+        (params['risk_free_rate'], params['risk_free_rate'] + 0.15),  # cost_of_debt bounds
         (0.1, 0.8)  # LTV_Cap bounds
     ]
     
-    # Run optimization
-    result = minimize(objective, x0, bounds=bounds, method='L-BFGS-B', options={'maxiter': 10})
+    # Constraints for optimization
+    constraints = [
+        {'type': 'ineq', 'fun': lambda x: params['min_profit_margin'] - 
+         calculate_metrics({**params, 'LoanPrincipal': x[0], 'cost_of_debt': x[1], 'LTV_Cap': x[2]}, 
+                          btc_prices, vol_heston)['term_sheet']['profit_margin']}
+    ]
     
-    if result.success:
-        optimized_principal = result.x[0]
-        optimized_rate = result.x[1]
-        optimized_ltv = result.x[2]
+    try:
+        # Run optimization with different methods for robustness
+        result = minimize(objective, x0, bounds=bounds, method='L-BFGS-B', 
+                         options={'maxiter': 20, 'ftol': 1e-6})
         
-        logger.info(f"Optimization successful: Principal=${optimized_principal:.2f}, Rate={optimized_rate:.4f}, LTV={optimized_ltv:.4f}")
-        
-        return {
-            'LoanPrincipal': optimized_principal,
-            'cost_of_debt': optimized_rate,
-            'LTV_Cap': optimized_ltv,
-            'BTC_purchased': optimized_principal / params['BTC_current_market_price']
-        }
-    else:
-        logger.warning(f"Optimization failed: {result.message}")
+        if result.success:
+            optimized_principal = max(0, result.x[0])
+            optimized_rate = max(params['risk_free_rate'], min(result.x[1], params['risk_free_rate'] + 0.15))
+            optimized_ltv = max(0.1, min(result.x[2], 0.8))
+            
+            logger.info(f"Optimization successful: Principal=${optimized_principal:.2f}, Rate={optimized_rate:.4f}, LTV={optimized_ltv:.4f}")
+            
+            return {
+                'LoanPrincipal': optimized_principal,
+                'cost_of_debt': optimized_rate,
+                'LTV_Cap': optimized_ltv,
+                'BTC_purchased': optimized_principal / params['BTC_current_market_price']
+            }
+        else:
+            logger.warning(f"Optimization failed: {result.message}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Optimization process error: {str(e)}")
         return None
 
 def generate_csv_response(metrics):
@@ -344,6 +365,7 @@ def generate_csv_response(metrics):
     writer = csv.writer(output)
     writer.writerow(['Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV', 'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
                      'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury', 'Profit Margin',
+                     'Savings', 'Reduced Risk', 'ROE Uplift',  # Added new columns
                      'Bull Case BTC Price', 'Bull Case NAV Impact', 'Bull Case LTV', 'Bull Case Probability',
                      'Base Case BTC Price', 'Base Case NAV Impact', 'Base Case LTV', 'Base Case Probability',
                      'Bear Case BTC Price', 'Bear Case NAV Impact', 'Bear Case LTV', 'Bear Case Probability',
@@ -356,6 +378,9 @@ def generate_csv_response(metrics):
                      metrics['term_sheet']['structure'], f"{metrics['term_sheet']['amount']:.2f}",
                      f"{metrics['term_sheet']['rate']:.4f}", f"{metrics['term_sheet']['btc_bought']:.2f}",
                      f"{metrics['term_sheet']['total_btc_treasury']:.2f}", f"{metrics['term_sheet']['profit_margin']:.4f}",
+                     f"{metrics['business_impact']['savings']:.2f}",  # Added savings
+                     f"{metrics['business_impact']['reduced_risk']:.4f}",  # Added reduced_risk
+                     f"{metrics['business_impact']['roe_uplift']:.2f}%",  # Added roe_uplift
                      f"{metrics['scenario_metrics']['Bull Case']['btc_price']:.2f}",
                      f"{metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
                      f"{metrics['scenario_metrics']['Bull Case']['ltv_ratio']:.4f}",
@@ -402,6 +427,9 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"BTC Bought: {metrics['term_sheet']['btc_bought']:.2f}",
         f"Total BTC Treasury: {metrics['term_sheet']['total_btc_treasury']:.2f}",
         f"Profit Margin: {metrics['term_sheet']['profit_margin']:.4f}",
+        f"Savings: {metrics['business_impact']['savings']:.2f}",  # Added savings
+        f"Reduced Risk: {metrics['business_impact']['reduced_risk']:.4f}",  # Added reduced_risk
+        f"ROE Uplift: {metrics['business_impact']['roe_uplift']:.2f}%",  # Added roe_uplift
         f"Bull Case BTC Price: ${metrics['scenario_metrics']['Bull Case']['btc_price']:.2f}",
         f"Bull Case NAV Impact: {metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
         f"Bull Case LTV: {metrics['scenario_metrics']['Bull Case']['ltv_ratio']:.4f}",
@@ -542,84 +570,97 @@ def what_if(request):
         
         if not param or value is None:
             raise ValueError("Both 'param' and 'value' must be provided")
-        if param not in DEFAULT_PARAMS and param not in ['LTV_Cap', 'beta_ROE']:
-            raise ValueError(f"Invalid parameter: {param}")
-        if value not in ['optimize', 'maximize'] and not isinstance(value, (int, float, str)):
-            raise ValueError(f"Invalid value for parameter {param}: {value}")
         
         validate_inputs(params)
         if params['use_live']:
             btc_price = fetch_btc_price()
             if btc_price:
                 params['BTC_current_market_price'] = btc_price
-                params['targetBTCPrice'] = btc_price if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice'] else params['targetBTCPrice']
+                if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
+                    params['targetBTCPrice'] = btc_price
         
         optimized_param = None
-        # PASS 1: Run simulation with initial inputs to generate advice
+        optimization_type = None
+        
+        # PASS 1: Run simulation with initial inputs
         logger.info("--- Starting What-If Pass 1 (Generate Advice) ---")
         btc_prices_pass1, vol_heston_pass1 = simulate_btc_paths(params, seed=42)
         
-        if param == 'LTV_Cap' and value == 'optimize':
-            # Optimize LTV_Cap using corporate treasury objectives
-            optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
-            if optimized_params:
-                params['LTV_Cap'] = optimized_params['LTV_Cap']
-                optimized_param = {'LTV_Cap': params['LTV_Cap']}
-                logger.info(f"Optimized LTV_Cap: {params['LTV_Cap']}")
+        # Handle different optimization scenarios
+        if value in ['optimize', 'maximize'] or (param == 'optimize_all' and value == 'corporate_treasury'):
+            if param == 'LTV_Cap' and value == 'optimize':
+                optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
+                if optimized_params:
+                    params['LTV_Cap'] = optimized_params['LTV_Cap']
+                    optimized_param = {'LTV_Cap': params['LTV_Cap']}
+                    optimization_type = 'LTV optimization'
+                    logger.info(f"Optimized LTV_Cap: {params['LTV_Cap']}")
+            
+            elif param == 'beta_ROE' and value == 'maximize':
+                optimized_params = optimize_for_roe(params, btc_prices_pass1, vol_heston_pass1)
+                if optimized_params:
+                    params['beta_ROE'] = optimized_params.get('beta_ROE', params['beta_ROE'])
+                    optimized_param = {'beta_ROE': params['beta_ROE']}
+                    optimization_type = 'ROE maximization'
+            
+            elif param == 'LoanPrincipal' and value == 'optimize':
+                optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
+                if optimized_params:
+                    params['LoanPrincipal'] = optimized_params['LoanPrincipal']
+                    optimized_param = {'LoanPrincipal': params['LoanPrincipal']}
+                    optimization_type = 'Loan amount optimization'
+            
+            elif param == 'cost_of_debt' and value == 'optimize':
+                optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
+                if optimized_params:
+                    params['cost_of_debt'] = optimized_params['cost_of_debt']
+                    optimized_param = {'cost_of_debt': params['cost_of_debt']}
+                    optimization_type = 'Interest rate optimization'
+            
+            elif param == 'optimize_all' and value == 'corporate_treasury':
+                optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
+                if optimized_params:
+                    params.update({k: v for k, v in optimized_params.items() if k in params})
+                    optimized_param = optimized_params
+                    optimization_type = 'Corporate treasury optimization'
+                    logger.info(f"Corporate treasury optimization: {optimized_params}")
+            
             else:
-                raise ValueError("Optimization for LTV_Cap failed")
-        elif param == 'beta_ROE' and value == 'maximize':
-            # Optimize beta_ROE using corporate treasury objectives
-            optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
-            if optimized_params:
-                params['beta_ROE'] = optimized_params['beta_ROE'] if 'beta_ROE' in optimized_params else params['beta_ROE']
-                optimized_param = {'beta_ROE': params['beta_ROE']}
-                logger.info(f"Optimized beta_ROE: {params['beta_ROE']}")
-            else:
-                raise ValueError("Optimization for beta_ROE failed")
+                raise ValueError(f"Invalid optimization for param {param} with value {value}")
+        
         else:
+            # Direct parameter setting
             try:
                 params[param] = float(value)
             except ValueError:
                 raise ValueError(f"Value for {param} must be a number, got {value}")
         
-        # Run metrics calculation with optimized or user-provided parameters
+        # Calculate metrics with optimized parameters
         response_data_pass1 = calculate_metrics(params, btc_prices_pass1, vol_heston_pass1)
         
-        # Extract optimized advice from Pass 1
+        # Extract optimized advice
         optimized_advice = response_data_pass1['term_sheet']
-        optimized_loan_amount = optimized_advice['amount']
-        optimized_btc_to_buy = optimized_advice['btc_bought']
-        optimized_loan_rate = optimized_advice['rate']
-        optimized_ltv_cap = optimized_advice['ltv_cap']
         
-        logger.info(f"Pass 1 Advice: Borrow ${optimized_loan_amount:.2f} at {optimized_loan_rate:.4%} to buy {optimized_btc_to_buy:.2f} BTC with LTV cap {optimized_ltv_cap:.4f}")
-
-        # PASS 2: Run simulation again with advice to create stable state
+        # PASS 2: Create stable state with optimized parameters
         logger.info("--- Starting What-If Pass 2 (Project Stable State) ---")
         stable_state_params = params.copy()
-        stable_state_params['LoanPrincipal'] = optimized_loan_amount
-        stable_state_params['cost_of_debt'] = optimized_loan_rate
-        stable_state_params['LTV_Cap'] = optimized_ltv_cap
-        stable_state_params['BTC_purchased'] = optimized_btc_to_buy
+        stable_state_params['LoanPrincipal'] = optimized_advice['amount']
+        stable_state_params['cost_of_debt'] = optimized_advice['rate']
+        stable_state_params['LTV_Cap'] = optimized_advice['ltv_cap']
+        stable_state_params['BTC_purchased'] = optimized_advice['btc_bought']
         
-        # Re-run simulation with stable state parameters
         btc_prices_pass2, vol_heston_pass2 = simulate_btc_paths(stable_state_params, seed=43)
         response_data_pass2 = calculate_metrics(stable_state_params, btc_prices_pass2, vol_heston_pass2)
         
-        # Combine results for final report
+        # Combine results
         final_response_data = response_data_pass2
         final_response_data['term_sheet'] = optimized_advice
         if optimized_param:
             final_response_data['optimized_param'] = optimized_param
+        if optimization_type:
+            final_response_data['optimization_type'] = optimization_type
         
-        logger.info("--- What-If Final Report Generated ---")
-        logger.info(f"Final NAV: {final_response_data['nav']['avg_nav']:.2f}")
-        logger.info(f"Final LTV: {final_response_data['ltv']['avg_ltv']:.4f}")
-        logger.info(f"Final BTC Purchase: {final_response_data['term_sheet']['btc_bought']:.2f}")
-        logger.info(f"Term Advice: Borrow ${final_response_data['term_sheet']['amount']:.2f}")
-
-        # Generate the requested export format
+        # Generate response
         if params['export_format'] == 'csv':
             return generate_csv_response(final_response_data)
         elif params['export_format'] == 'pdf':
@@ -628,13 +669,27 @@ def what_if(request):
     
     except Exception as e:
         logger.error(f"What-If endpoint error: {str(e)}")
-        error_response = f"Error: {str(e)}"
-        export_format = params.get('export_format', 'json')
-        if export_format == 'csv':
-            return HttpResponse(error_response, content_type='text/plain', status=400)
-        elif export_format == 'pdf':
-            return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
+    
+# Additional helper function for ROE optimization
+def optimize_for_roe(params, btc_prices, vol_heston):
+    """
+    Specialized optimization for ROE maximization
+    """
+    def roe_objective(beta):
+        temp_params = params.copy()
+        temp_params['beta_ROE'] = beta
+        metrics = calculate_metrics(temp_params, btc_prices, vol_heston)
+        return -metrics['roe']['avg_roe']  # Negative for minimization
+    
+    try:
+        result = minimize_scalar(roe_objective, bounds=(1.0, 5.0), method='bounded')
+        if result.success:
+            return {'beta_ROE': result.x}
+    except Exception as e:
+        logger.error(f"ROE optimization failed: {str(e)}")
+    
+    return None
     
 @csrf_exempt
 def get_btc_price(request):
