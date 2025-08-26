@@ -1,6 +1,7 @@
 [report]
 include =
     */views.py
+     */utils/*.py
 omit =
     */migrations/*
     */tests.py
