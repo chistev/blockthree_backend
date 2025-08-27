@@ -2,7 +2,6 @@ from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt
 import numpy as np
-from scipy.stats import norm
 from scipy.optimize import minimize, minimize_scalar
 import requests
 import json
@@ -12,6 +11,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import logging
 
+from risk_calculator.utils.metrics import calculate_metrics
 from risk_calculator.utils.simulation import simulate_btc_paths
 
 logging.basicConfig(level=logging.INFO)
@@ -26,10 +26,10 @@ DEFAULT_PARAMS = {
     'sigma': 0.55,
     't': 1,
     'delta': 0.08,
-    'initial_equity_value': 1000000,
-    'new_equity_raised': 50000,
+    'initial_equity_value': 90000000,
+    'new_equity_raised': 5000000, 
     'IssuePrice': 117000,
-    'LoanPrincipal': 50000000,
+    'LoanPrincipal': 25000000, 
     'cost_of_debt': 0.06,
     'dilution_vol_estimate': 0.55,
     'LTV_Cap': 0.5,
@@ -67,147 +67,6 @@ def validate_inputs(params):
         raise ValueError("BTC_purchased cannot be negative")
     if params['paths'] < 1:
         raise ValueError("paths must be at least 1")
-
-def calculate_metrics(params, btc_prices, vol_heston):
-    final_btc_price = btc_prices[-1]
-    total_btc = params['BTC_treasury'] + params['BTC_purchased']
-    CollateralValue_t = total_btc * final_btc_price
-    base_dilution = params['new_equity_raised'] / (params['initial_equity_value'] + params['new_equity_raised'])
-    
-    nav_paths_temp = [(total_btc * p + total_btc * p * params['delta'] - params['LoanPrincipal'] * params['cost_of_debt']) / 
-                     (params['initial_equity_value'] + params['new_equity_raised']) for p in btc_prices]
-    dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * params['IssuePrice'], nav, params['dilution_vol_estimate'] * np.sqrt(params['t']))) 
-                     for nav in nav_paths_temp]
-    avg_dilution = np.mean(dilution_paths)
-    nav_paths = [nav - avg_dilution for nav in nav_paths_temp]
-    avg_nav = np.mean(nav_paths)
-    ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(params['paths'])
-    erosion_prob = np.mean(np.array(nav_paths) < 0.9 * avg_nav)
-    ci_dilution = 1.96 * np.std(dilution_paths) / np.sqrt(params['paths'])
-    
-    S = final_btc_price * total_btc
-    if vol_heston[-1] == 0:
-        raise ZeroDivisionError("Volatility (vol_heston[-1]) cannot be zero in Black-Scholes calculation")
-    d1 = (np.log(S / params['IssuePrice']) + (params['risk_free_rate'] + params['delta'] + 0.5 * vol_heston[-1] ** 2) * params['t']) / (vol_heston[-1] * np.sqrt(params['t']))
-    d2 = d1 - vol_heston[-1] * np.sqrt(params['t'])
-    convertible_value = S * norm.cdf(d1) - params['IssuePrice'] * np.exp(-(params['risk_free_rate'] + params['delta']) * params['t']) * norm.cdf(d2)
-    
-    ltv_paths = [params['LoanPrincipal'] / (total_btc * p) for p in btc_prices]
-    avg_ltv = np.mean(ltv_paths)
-    ci_ltv = 1.96 * np.std(ltv_paths) / np.sqrt(params['paths'])
-    exceed_prob = np.mean(np.array(ltv_paths) > params['LTV_Cap'])
-    
-    roe_t = params['risk_free_rate'] + params['beta_ROE'] * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_heston[-1] / params['long_run_volatility'])
-    avg_roe = np.mean(roe_t)
-    ci_roe = 1.96 * np.std(roe_t) / np.sqrt(params['paths'])
-    sharpe = (avg_roe - params['risk_free_rate']) / np.std(roe_t) if np.std(roe_t) != 0 else 0
-    
-    tax_rate = 0.2
-    bundle_value = (0.4 * avg_nav + 0.3 * avg_dilution + 0.3 * convertible_value) * (1 - tax_rate)
-    
-    # Calculate profit margin for the business
-    business_profit = (params['cost_of_debt'] - params['risk_free_rate']) * params['LoanPrincipal']
-    profit_margin = business_profit / params['LoanPrincipal'] if params['LoanPrincipal'] > 0 else 0
-    
-    optimized_ltv = 0.5 if exceed_prob < 0.15 else params['LTV_Cap']
-    optimized_rate = params['risk_free_rate'] + 0.02 * (params['sigma'] / params['long_run_volatility'])
-    optimized_amount = CollateralValue_t * optimized_ltv
-    optimized_btc = optimized_amount / params['BTC_current_market_price']
-    adjusted_savings = (base_dilution * params['initial_equity_value'] * params['BTC_current_market_price']) - avg_dilution
-    roe_uplift = avg_roe - (params['expected_return_btc'] * params['beta_ROE'])
-    kept_money = adjusted_savings + roe_uplift * params['initial_equity_value'] * params['BTC_current_market_price']
-    
-    term_sheet = {
-        'structure': 'Convertible Note' if avg_dilution < 0.1 else 'BTC-Collateralized Loan',
-        'amount': optimized_amount,
-        'rate': optimized_rate,
-        'term': params['t'],
-        'ltv_cap': optimized_ltv,
-        'collateral': CollateralValue_t,
-        'conversion_premium': 0.3 if convertible_value > 0 else 0,
-        'btc_bought': optimized_btc,
-        'total_btc_treasury': total_btc,
-        'savings': adjusted_savings,
-        'roe_uplift': roe_uplift * 100,
-        'profit_margin': profit_margin
-    }
-    business_impact = {
-        'btc_could_buy': optimized_btc,
-        'savings': adjusted_savings,
-        'kept_money': kept_money,
-        'roe_uplift': roe_uplift * 100,
-        'reduced_risk': erosion_prob,
-        'profit_margin': profit_margin
-    }
-    
-    target_btc_price = params['targetBTCPrice']
-    target_collateral_value = total_btc * target_btc_price
-    target_nav = (target_collateral_value + target_collateral_value * params['delta'] - params['LoanPrincipal'] * params['cost_of_debt'] - avg_dilution) / (params['initial_equity_value'] + params['new_equity_raised'])
-    target_ltv = params['LoanPrincipal'] / (total_btc * target_btc_price)
-    target_s = target_btc_price * total_btc
-    target_d1 = (np.log(target_s / params['IssuePrice']) + (params['risk_free_rate'] + params['delta'] + 0.5 * vol_heston[-1] ** 2) * params['t']) / (vol_heston[-1] * np.sqrt(params['t']))
-    target_d2 = target_d1 - vol_heston[-1] * np.sqrt(params['t'])
-    target_convertible_value = target_s * norm.cdf(target_d1) - params['IssuePrice'] * np.exp(-(params['risk_free_rate'] + params['delta']) * params['t']) * norm.cdf(target_d2)
-    target_roe = params['risk_free_rate'] + params['beta_ROE'] * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_heston[-1] / params['long_run_volatility'])
-    target_bundle_value = (0.4 * target_nav + 0.3 * avg_dilution + 0.3 * target_convertible_value) * (1 - tax_rate)
-    
-    target_metrics = {
-        'target_nav': target_nav,
-        'target_ltv': target_ltv,
-        'target_convertible_value': target_convertible_value,
-        'target_roe': target_roe,
-        'target_bundle_value': target_bundle_value
-    }
-    
-    scenarios = {
-        'Bull Case': {'price_multiplier': 1.5, 'probability': 0.25},
-        'Base Case': {'price_multiplier': 1.0, 'probability': 0.40},
-        'Bear Case': {'price_multiplier': 0.7, 'probability': 0.25},
-        'Stress Test': {'price_multiplier': 0.4, 'probability': 0.10}
-    }
-
-    scenario_metrics = {}
-    for scenario_name, config in scenarios.items():
-        price_multiplier = config['price_multiplier']
-        probability = config['probability']
-        scenario_btc_price = params['BTC_current_market_price'] * price_multiplier
-        scenario_collateral_value = total_btc * scenario_btc_price
-        scenario_nav = (scenario_collateral_value + scenario_collateral_value * params['delta'] - 
-                       params['LoanPrincipal'] * params['cost_of_debt'] - avg_dilution) / \
-                       (params['initial_equity_value'] + params['new_equity_raised'])
-        scenario_ltv = params['LoanPrincipal'] / (total_btc * scenario_btc_price)
-        nav_impact = ((scenario_nav - avg_nav) / avg_nav) * 100 if avg_nav != 0 else 0
-        price_threshold = params['BTC_current_market_price'] * price_multiplier
-        if scenario_name == 'Bull Case':
-            scenario_prob = np.mean(btc_prices >= price_threshold)
-        elif scenario_name == 'Bear Case' or scenario_name == 'Stress Test':
-            scenario_prob = np.mean(btc_prices <= price_threshold)
-        else:
-            scenario_prob = probability
-        scenario_metrics[scenario_name] = {
-            'btc_price': scenario_btc_price,
-            'nav_impact': nav_impact,
-            'ltv_ratio': scenario_ltv,
-            'probability': scenario_prob
-        }
-
-    response_data = {
-        'nav': {'avg_nav': avg_nav, 'ci_lower': avg_nav - ci_nav, 'ci_upper': avg_nav + ci_nav, 
-                'erosion_prob': erosion_prob, 'nav_paths': nav_paths[:100]},
-        'dilution': {'base_dilution': base_dilution, 'avg_dilution': avg_dilution, 
-                     'ci_lower': avg_dilution - ci_dilution, 'ci_upper': avg_dilution + ci_dilution},
-        'convertible': {'avg_convertible': convertible_value, 'ci_lower': convertible_value, 'ci_upper': convertible_value},
-        'ltv': {'avg_ltv': avg_ltv, 'ci_lower': avg_ltv - ci_ltv, 'ci_upper': avg_ltv + ci_ltv, 
-                'exceed_prob': exceed_prob, 'ltv_paths': ltv_paths[:100]},
-        'roe': {'avg_roe': avg_roe, 'ci_lower': avg_roe - ci_roe, 'ci_upper': avg_roe + ci_roe, 'sharpe': sharpe},
-        'preferred_bundle': {'bundle_value': bundle_value, 'ci_lower': bundle_value * 0.98, 'ci_upper': bundle_value * 1.02},
-        'term_sheet': term_sheet,
-        'business_impact': business_impact,
-        'target_metrics': target_metrics,
-        'scenario_metrics': scenario_metrics
-    }
-    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}")
-    return response_data
 
 def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
     """
@@ -300,40 +159,70 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
 def generate_csv_response(metrics):
     output = StringIO()
     writer = csv.writer(output)
-    writer.writerow(['Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV', 'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
-                     'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury', 'Profit Margin',
-                     'Savings', 'Reduced Risk', 'ROE Uplift',  # Added new columns
-                     'Bull Case BTC Price', 'Bull Case NAV Impact', 'Bull Case LTV', 'Bull Case Probability',
-                     'Base Case BTC Price', 'Base Case NAV Impact', 'Base Case LTV', 'Base Case Probability',
-                     'Bear Case BTC Price', 'Bear Case NAV Impact', 'Bear Case LTV', 'Bear Case Probability',
-                     'Stress Test BTC Price', 'Stress Test NAV Impact', 'Stress Test LTV', 'Stress Test Probability'])
-    writer.writerow([f"{metrics['nav']['avg_nav']:.2f}", f"{metrics['target_metrics']['target_nav']:.2f}",
-                     f"{metrics['dilution']['avg_dilution']:.4f}",
-                     f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['target_metrics']['target_ltv']:.4f}",
-                     f"{metrics['roe']['avg_roe']:.4f}", f"{metrics['target_metrics']['target_roe']:.4f}",
-                     f"{metrics['preferred_bundle']['bundle_value']:.2f}", f"{metrics['target_metrics']['target_bundle_value']:.2f}",
-                     metrics['term_sheet']['structure'], f"{metrics['term_sheet']['amount']:.2f}",
-                     f"{metrics['term_sheet']['rate']:.4f}", f"{metrics['term_sheet']['btc_bought']:.2f}",
-                     f"{metrics['term_sheet']['total_btc_treasury']:.2f}", f"{metrics['term_sheet']['profit_margin']:.4f}",
-                     f"{metrics['business_impact']['savings']:.2f}",  # Added savings
-                     f"{metrics['business_impact']['reduced_risk']:.4f}",  # Added reduced_risk
-                     f"{metrics['business_impact']['roe_uplift']:.2f}%",  # Added roe_uplift
-                     f"{metrics['scenario_metrics']['Bull Case']['btc_price']:.2f}",
-                     f"{metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
-                     f"{metrics['scenario_metrics']['Bull Case']['ltv_ratio']:.4f}",
-                     f"{metrics['scenario_metrics']['Bull Case']['probability']:.2f}",
-                     f"{metrics['scenario_metrics']['Base Case']['btc_price']:.2f}",
-                     f"{metrics['scenario_metrics']['Base Case']['nav_impact']:.2f}%",
-                     f"{metrics['scenario_metrics']['Base Case']['ltv_ratio']:.4f}",
-                     f"{metrics['scenario_metrics']['Base Case']['probability']:.2f}",
-                     f"{metrics['scenario_metrics']['Bear Case']['btc_price']:.2f}",
-                     f"{metrics['scenario_metrics']['Bear Case']['nav_impact']:.2f}%",
-                     f"{metrics['scenario_metrics']['Bear Case']['ltv_ratio']:.4f}",
-                     f"{metrics['scenario_metrics']['Bear Case']['probability']:.2f}",
-                     f"{metrics['scenario_metrics']['Stress Test']['btc_price']:.2f}",
-                     f"{metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%",
-                     f"{metrics['scenario_metrics']['Stress Test']['ltv_ratio']:.4f}",
-                     f"{metrics['scenario_metrics']['Stress Test']['probability']:.2f}"])
+    writer.writerow([
+        'Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV', 
+        'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
+        'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury', 
+        'Profit Margin', 'Savings', 'Reduced Risk', 'ROE Uplift',
+        'Bull Case BTC Price', 'Bull Case NAV Impact', 'Bull Case LTV', 'Bull Case Probability',
+        'Base Case BTC Price', 'Base Case NAV Impact', 'Base Case LTV', 'Base Case Probability',
+        'Bear Case BTC Price', 'Bear Case NAV Impact', 'Bear Case LTV', 'Bear Case Probability',
+        'Stress Test BTC Price', 'Stress Test NAV Impact', 'Stress Test LTV', 'Stress Test Probability',
+        # New distribution_metrics fields
+        'Bull Market Probability', 'Bear Market Probability', 'Stress Test Probability', 
+        'Normal Market Probability', 'Value at Risk 95%', 'Expected Shortfall',
+        'Price Distribution Mean', 'Price Distribution Std Dev', 'Price Distribution Min', 
+        'Price Distribution Max', 'Price Distribution 5th Percentile', 
+        'Price Distribution 25th Percentile', 'Price Distribution 50th Percentile',
+        'Price Distribution 75th Percentile', 'Price Distribution 95th Percentile'
+    ])
+    writer.writerow([
+        f"{metrics['nav']['avg_nav']:.2f}", f"{metrics['target_metrics']['target_nav']:.2f}",
+        f"{metrics['dilution']['avg_dilution']:.4f}",
+        f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['target_metrics']['target_ltv']:.4f}",
+        f"{metrics['roe']['avg_roe']:.4f}", f"{metrics['target_metrics']['target_roe']:.4f}",
+        f"{metrics['preferred_bundle']['bundle_value']:.2f}", 
+        f"{metrics['target_metrics']['target_bundle_value']:.2f}",
+        metrics['term_sheet']['structure'], f"{metrics['term_sheet']['amount']:.2f}",
+        f"{metrics['term_sheet']['rate']:.4f}", f"{metrics['term_sheet']['btc_bought']:.2f}",
+        f"{metrics['term_sheet']['total_btc_treasury']:.2f}", 
+        f"{metrics['term_sheet']['profit_margin']:.4f}",
+        f"{metrics['business_impact']['savings']:.2f}",
+        f"{metrics['business_impact']['reduced_risk']:.4f}",
+        f"{metrics['business_impact']['roe_uplift']:.2f}%",
+        f"{metrics['scenario_metrics']['Bull Case']['btc_price']:.2f}",
+        f"{metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
+        f"{metrics['scenario_metrics']['Bull Case']['ltv_ratio']:.4f}",
+        f"{metrics['scenario_metrics']['Bull Case']['probability']:.2f}",
+        f"{metrics['scenario_metrics']['Base Case']['btc_price']:.2f}",
+        f"{metrics['scenario_metrics']['Base Case']['nav_impact']:.2f}%",
+        f"{metrics['scenario_metrics']['Base Case']['ltv_ratio']:.4f}",
+        f"{metrics['scenario_metrics']['Base Case']['probability']:.2f}",
+        f"{metrics['scenario_metrics']['Bear Case']['btc_price']:.2f}",
+        f"{metrics['scenario_metrics']['Bear Case']['nav_impact']:.2f}%",
+        f"{metrics['scenario_metrics']['Bear Case']['ltv_ratio']:.4f}",
+        f"{metrics['scenario_metrics']['Bear Case']['probability']:.2f}",
+        f"{metrics['scenario_metrics']['Stress Test']['btc_price']:.2f}",
+        f"{metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%",
+        f"{metrics['scenario_metrics']['Stress Test']['ltv_ratio']:.4f}",
+        f"{metrics['scenario_metrics']['Stress Test']['probability']:.2f}",
+        # New distribution_metrics values
+        f"{metrics['distribution_metrics']['bull_market_prob']:.4f}",
+        f"{metrics['distribution_metrics']['bear_market_prob']:.4f}",
+        f"{metrics['distribution_metrics']['stress_test_prob']:.4f}",
+        f"{metrics['distribution_metrics']['normal_market_prob']:.4f}",
+        f"{metrics['distribution_metrics']['var_95']:.2f}",
+        f"{metrics['distribution_metrics']['expected_shortfall']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['mean']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['std_dev']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['min']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['max']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['percentiles']['5th']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['percentiles']['25th']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['percentiles']['50th']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['percentiles']['75th']:.2f}",
+        f"{metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}"
+    ])
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="metrics.csv"'
     response.write(output.getvalue().encode('utf-8'))
@@ -364,9 +253,9 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"BTC Bought: {metrics['term_sheet']['btc_bought']:.2f}",
         f"Total BTC Treasury: {metrics['term_sheet']['total_btc_treasury']:.2f}",
         f"Profit Margin: {metrics['term_sheet']['profit_margin']:.4f}",
-        f"Savings: {metrics['business_impact']['savings']:.2f}",  # Added savings
-        f"Reduced Risk: {metrics['business_impact']['reduced_risk']:.4f}",  # Added reduced_risk
-        f"ROE Uplift: {metrics['business_impact']['roe_uplift']:.2f}%",  # Added roe_uplift
+        f"Savings: {metrics['business_impact']['savings']:.2f}",
+        f"Reduced Risk: {metrics['business_impact']['reduced_risk']:.4f}",
+        f"ROE Uplift: {metrics['business_impact']['roe_uplift']:.2f}%",
         f"Bull Case BTC Price: ${metrics['scenario_metrics']['Bull Case']['btc_price']:.2f}",
         f"Bull Case NAV Impact: {metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
         f"Bull Case LTV: {metrics['scenario_metrics']['Bull Case']['ltv_ratio']:.4f}",
@@ -382,7 +271,23 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Stress Test BTC Price: ${metrics['scenario_metrics']['Stress Test']['btc_price']:.2f}",
         f"Stress Test NAV Impact: {metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%",
         f"Stress Test LTV: {metrics['scenario_metrics']['Stress Test']['ltv_ratio']:.4f}",
-        f"Stress Test Probability: {metrics['scenario_metrics']['Stress Test']['probability']:.2f}"
+        f"Stress Test Probability: {metrics['scenario_metrics']['Stress Test']['probability']:.2f}",
+        # New distribution_metrics fields
+        f"Bull Market Probability: {metrics['distribution_metrics']['bull_market_prob']:.4f}",
+        f"Bear Market Probability: {metrics['distribution_metrics']['bear_market_prob']:.4f}",
+        f"Stress Test Probability: {metrics['distribution_metrics']['stress_test_prob']:.4f}",
+        f"Normal Market Probability: {metrics['distribution_metrics']['normal_market_prob']:.4f}",
+        f"Value at Risk 95%: ${metrics['distribution_metrics']['var_95']:.2f}",
+        f"Expected Shortfall: ${metrics['distribution_metrics']['expected_shortfall']:.2f}",
+        f"Price Distribution Mean: ${metrics['distribution_metrics']['price_distribution']['mean']:.2f}",
+        f"Price Distribution Std Dev: ${metrics['distribution_metrics']['price_distribution']['std_dev']:.2f}",
+        f"Price Distribution Min: ${metrics['distribution_metrics']['price_distribution']['min']:.2f}",
+        f"Price Distribution Max: ${metrics['distribution_metrics']['price_distribution']['max']:.2f}",
+        f"Price Distribution 5th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['5th']:.2f}",
+        f"Price Distribution 25th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['25th']:.2f}",
+        f"Price Distribution 50th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['50th']:.2f}",
+        f"Price Distribution 75th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['75th']:.2f}",
+        f"Price Distribution 95th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}"
     ]
     
     for item in items:
@@ -398,7 +303,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
     pdf = buffer.getvalue()
     buffer.close()
     response = HttpResponse(content_type='application/pdf')
-    response['Content-Disposition'] = f'attachment; filename="{title.lower().replace(" ", "_")}.pdf"'
+    response['Content-Disposition'] = f'attachment; filename="{title.lower().replace(' ', '_')}.pdf"'
     response.write(pdf)
     return response
 
