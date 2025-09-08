@@ -7,13 +7,17 @@ logger = logging.getLogger(__name__)
 def simulate_btc_paths(params, seed=42):
     np.random.seed(seed)
 
+    # Define number of paths and timesteps
+    N = params['paths']  # Number of independent paths
+    T = 252  # Number of timesteps (e.g., trading days in a year)
+    
     if params['t'] == 0:
-        # Prices stay constant, volatility still returned
-        btc_prices = np.full(params['paths'], params['BTC_treasury'])
-        vol_heston = np.full(params['paths'] - 1, params['sigma'])
+        # Return constant prices for all paths
+        btc_prices = np.full((N, T), params['BTC_current_market_price'])  # Use market price
+        vol_heston = np.full((N, T - 1), params['sigma'])
         return btc_prices, vol_heston
     
-    dt = params['t'] / params['paths']
+    dt = params['t'] / T  # Time step size
 
     # Adjust drift using Bayesian estimate and jump component
     mu_bayes = 0.5 * params['mu'] + 0.5 * 0.4
@@ -31,39 +35,43 @@ def simulate_btc_paths(params, seed=42):
     mu_adj = 0.7 * mu_adj + 0.3 * drift_to_target
     logger.info(f"Adjusted drift: {mu_adj}")
 
-    # Initial return simulation
-    btc_returns_init = np.random.normal(
+    # Initialize arrays for prices and volatilities
+    btc_prices = np.zeros((N, T))
+    vol_heston = np.zeros((N, T - 1))
+    btc_prices[:, 0] = params['BTC_current_market_price']  # Start all paths at current price
+
+    # Generate one set of log returns for GARCH (to ensure consistency across paths)
+    temp_returns = np.random.normal(
         loc=mu_adj * dt,
         scale=params['sigma'] * np.sqrt(dt),
-        size=params['paths']
+        size=T
     )
-    btc_prices_init = params['BTC_treasury'] * np.exp(np.cumsum(btc_returns_init))
-
-    # Log returns for GARCH model
-    log_returns = np.log(btc_prices_init[1:] / btc_prices_init[:-1]) * 100
+    temp_prices = params['BTC_current_market_price'] * np.exp(np.cumsum(temp_returns))
+    log_returns = np.log(temp_prices[1:] / temp_prices[:-1]) * 100
     garch_model = arch_model(log_returns, p=1, q=1, mean='Zero', vol='GARCH')
     garch_fit = garch_model.fit(disp='off', options={'maxiter': 100})
     vol_garch = garch_fit.conditional_volatility / 100
     logger.info(f"GARCH volatility mean: {np.mean(vol_garch)}")
 
-    # Combine GARCH with Heston-like volatility model
-    time_grid = np.linspace(0, params['t'], len(vol_garch))
-    vol_heston = (
+    # Heston-like volatility model
+    time_grid = np.linspace(0, params['t'], T - 1)
+    vol_heston_base = (
         params['long_run_volatility'] +
         (params['sigma'] - params['long_run_volatility']) *
         np.exp(-params['vol_mean_reversion_speed'] * time_grid) +
         vol_garch
     )
 
-    # Final return simulation with jumps
-    btc_returns = np.zeros(params['paths'])
-    for i in range(params['paths']):
-        vol = vol_heston[min(i, len(vol_heston) - 1)]
-        btc_returns[i] = np.random.normal(loc=mu_adj * dt, scale=vol * np.sqrt(dt))
-        if np.random.random() < params['jump_intensity'] * dt:
-            btc_returns[i] += np.random.normal(params['jump_mean'], params['jump_volatility'])
-
-    btc_prices = params['BTC_treasury'] * np.exp(np.cumsum(btc_returns))
-    logger.info(f"Simulated BTC price mean: {np.mean(btc_prices)}")
-
+    # Simulate N independent paths
+    for i in range(N):
+        btc_returns = np.zeros(T)
+        vol_heston[i, :] = vol_heston_base  # Use same volatility path for consistency
+        for t in range(1, T):
+            vol = vol_heston[i, t - 1]
+            btc_returns[t] = np.random.normal(loc=mu_adj * dt, scale=vol * np.sqrt(dt))
+            if np.random.random() < params['jump_intensity'] * dt:
+                btc_returns[t] += np.random.normal(params['jump_mean'], params['jump_volatility'])
+        btc_prices[i, :] = params['BTC_current_market_price'] * np.exp(np.cumsum(btc_returns))
+    
+    logger.info(f"Simulated BTC price mean (terminal): {np.mean(btc_prices[:, -1])}")
     return btc_prices, vol_heston
