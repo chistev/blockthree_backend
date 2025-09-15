@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt
@@ -9,10 +10,21 @@ from io import StringIO, BytesIO
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import logging
+import pdfplumber
+import pandas as pd
+import re
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from risk_calculator.utils.metrics import calculate_metrics
 from risk_calculator.utils.optimization import optimize_for_corporate_treasury
 from risk_calculator.utils.simulation import simulate_btc_paths
+
+from fuzzywuzzy import fuzz
+import spacy
+
+from docx import Document
+
+nlp = spacy.load('en_core_web_sm')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,9 +39,9 @@ DEFAULT_PARAMS = {
     't': 1,
     'delta': 0.08,
     'initial_equity_value': 90000000,
-    'new_equity_raised': 5000000, 
+    'new_equity_raised': 5000000,
     'IssuePrice': 117000,
-    'LoanPrincipal': 25000000, 
+    'LoanPrincipal': 25000000,
     'cost_of_debt': 0.06,
     'dilution_vol_estimate': 0.55,
     'LTV_Cap': 0.5,
@@ -46,7 +58,7 @@ DEFAULT_PARAMS = {
 }
 
 def get_json_data(request):
-    return request.get_json() if hasattr(request, 'get_json') else json.loads(request.body.decode('utf-8'))
+    return json.loads(request.body.decode('utf-8'))
 
 def fetch_btc_price():
     try:
@@ -68,23 +80,250 @@ def validate_inputs(params):
     if params['paths'] < 1:
         raise ValueError("paths must be at least 1")
 
+def fetch_sec_data(ticker):
+    """
+    Fetch financial data for a given ticker using Alpha Vantage API with retry logic.
+    """
+    try:
+        api_key = settings.ALPHA_VANTAGE_API_KEY
+        if not api_key:
+            raise ValueError("Alpha Vantage API key is invalid or missing. Check your .env file.")
+
+        @retry(
+            stop=stop_after_attempt(3),  # Retry up to 3 times
+            wait=wait_exponential(multiplier=1, min=4, max=10),  # Exponential backoff: 4s, 8s, 10s
+            retry=retry_if_exception_type(requests.exceptions.RequestException),  # Retry on network errors
+            before_sleep=lambda retry_state: logger.warning(
+                f"Retrying Alpha Vantage API call (attempt {retry_state.attempt_number})..."
+            )
+        )
+        def make_api_call():
+            url = f'https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={ticker}&apikey={api_key}'
+            response = requests.get(url)
+            response.raise_for_status()  # Raise exception for 4xx/5xx errors
+            return response.json()
+
+        data = make_api_call()
+
+        if 'annualReports' not in data:
+            if 'Information' in data and 'API rate limit' in data['Information']:
+                raise ValueError("Alpha Vantage API rate limit exceeded. Please try again later.")
+            raise ValueError(f"No data found for ticker {ticker}")
+
+        latest_report = data['annualReports'][0]
+        total_equity = float(latest_report.get('totalShareholderEquity', 0))
+        total_debt = float(latest_report.get('longTermDebt', 0))
+        new_equity_raised = float(latest_report.get('capitalStock', 0))  # Approximation
+
+        return {
+            'initial_equity_value': total_equity if total_equity > 0 else DEFAULT_PARAMS['initial_equity_value'],
+            'loan_principal': total_debt if total_debt > 0 else DEFAULT_PARAMS['LoanPrincipal'],
+            'new_equity_raised': new_equity_raised if new_equity_raised > 0 else DEFAULT_PARAMS['new_equity_raised'],
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch SEC data for {ticker}: {str(e)}")
+        return {'error': str(e)}
+    
+def parse_sec_file(file, ticker):
+    """
+    Parse uploaded SEC filing (PDF, XLSX, CSV, Docx) to extract financial metrics with enhanced parsing and validation.
+    """
+    try:
+        # Initialize result dictionary
+        result = {
+    'initial_equity_value': DEFAULT_PARAMS['initial_equity_value'],
+    'LoanPrincipal': DEFAULT_PARAMS['LoanPrincipal'],
+    'new_equity_raised': DEFAULT_PARAMS['new_equity_raised']
+}
+
+        if file.name.endswith('.pdf'):
+            with pdfplumber.open(file) as pdf:
+                # Try table extraction first
+                for page in pdf.pages:
+                    tables = page.extract_tables()
+                    for table in tables:
+                        for row in table:
+                            row_text = ' '.join(str(cell) for cell in row if cell)
+                            # Enhanced regex patterns
+                            patterns = {
+                                'initial_equity_value': [
+                                    r"Total\s+Shareholders?\s+Equity\s+[\$]?([\d,]+(?:\.\d+)?)",
+                                    r"Shareholders?\s+Equity\s+[\$]?([\d,]+(?:\.\d+)?)",
+                                    r"Total\s+Equity\s+[\$]?([\d,]+(?:\.\d+)?)"
+                                ],
+                                'LoanPrincipal': [
+                                    r"Long-Term\s+Debt\s+[\$]?([\d,]+(?:\.\d+)?)",
+                                    r"Total\s+Debt\s+[\$]?([\d,]+(?:\.\d+)?)",
+                                    r"Long\s+Term\s+Liabilities\s+[\$]?([\d,]+(?:\.\d+)?)"
+                                ],
+                                'new_equity_raised': [
+                                    r"Capital\s+Stock\s+[\$]?([\d,]+(?:\.\d+)?)",
+                                    r"Common\s+Stock\s+[\$]?([\d,]+(?:\.\d+)?)",
+                                    r"Equity\s+Raised\s+[\$]?([\d,]+(?:\.\d+)?)"
+                                ]
+                            }
+                            for key, pattern_list in patterns.items():
+                                for pattern in pattern_list:
+                                    match = re.search(pattern, row_text, re.IGNORECASE)
+                                    if match:
+                                        try:
+                                            value = float(match.group(1).replace(',', ''))
+                                            if value > 0:
+                                                result[key] = value
+                                            else:
+                                                logger.warning(f"Non-positive value for {key} in table: {value}")
+                                        except ValueError:
+                                            logger.warning(f"Invalid number format for {key} in table: {match.group(1)}")
+
+                # Fallback to text extraction with spaCy if table extraction fails
+                if not any(result[key] != DEFAULT_PARAMS[key] for key in result):
+                    text = ''
+                    for page in pdf.pages:
+                        text += page.extract_text() or ''
+                    doc = nlp(text)
+                    for ent in doc.ents:
+                        if ent.label_ in ['MONEY', 'CARDINAL']:
+                            ent_text = ent.text.replace(',', '').replace('$', '')
+                            try:
+                                value = float(ent_text)
+                                if value > 0:
+                                    context = text[max(0, ent.start_char-50):ent.end_char+50].lower()
+                                    if 'equity' in context or 'shareholder' in context:
+                                        result['initial_equity_value'] = value
+                                    elif 'debt' in context or 'liabilities' in context:
+                                        result['loan_principal'] = value
+                                    elif 'capital' in context or 'stock' in context:
+                                        result['new_equity_raised'] = value
+                            except ValueError:
+                                logger.warning(f"Invalid number format in spaCy entity: {ent_text}")
+
+        elif file.name.endswith('.xlsx') or file.name.endswith('.csv'):
+            # Read file in chunks to optimize memory
+            chunksize = 1000
+            if file.name.endswith('.xlsx'):
+                df_iter = pd.read_excel(file, chunksize=chunksize)
+            else:
+                df_iter = pd.read_csv(file, chunksize=chunksize)
+
+            for df in df_iter:
+                # Fuzzy matching for column names
+                target_columns = {
+                    'initial_equity_value': ['Total Shareholder Equity', 'Shareholder Equity', 'Total Equity', 'Equity'],
+                    'LoanPrincipal': ['Long-Term Debt', 'Long Term Debt', 'Total Debt', 'Liabilities'],
+                    'new_equity_raised': ['Capital Stock', 'Common Stock', 'Equity Raised', 'Capital']
+                }
+                for key, synonyms in target_columns.items():
+                    for col in df.columns:
+                        if any(fuzz.partial_ratio(col.lower(), synonym.lower()) > 80 for synonym in synonyms):
+                            try:
+                                value = float(df[col].iloc[0])
+                                if value > 0:
+                                    result[key] = value
+                                else:
+                                    logger.warning(f"Non-positive value for {key} in column {col}: {value}")
+                            except (ValueError, TypeError):
+                                logger.warning(f"Invalid data in column {col} for {key}")
+                            break
+        
+        elif file.name.endswith('.docx'):
+            doc = Document(file)
+            text = ''
+            for para in doc.paragraphs:
+                text += para.text + '\n'
+            # Use spaCy for entity recognition
+            doc_nlp = nlp(text)
+            for ent in doc_nlp.ents:
+                if ent.label_ in ['MONEY', 'CARDINAL']:
+                    ent_text = ent.text.replace(',', '').replace('$', '')
+                    try:
+                        value = float(ent_text)
+                        if value > 0:
+                            context = text[max(0, ent.start_char-50):ent.end_char+50].lower()
+                            if 'equity' in context or 'shareholder' in context:
+                                result['initial_equity_value'] = value
+                            elif 'debt' in context or 'liabilities' in context:
+                                result['loan_principal'] = value
+                            elif 'capital' in context or 'stock' in context:
+                                result['new_equity_raised'] = value
+                    except ValueError:
+                        logger.warning(f"Invalid number format in DOCX entity: {ent_text}")
+        else:
+            raise ValueError("Unsupported file format. Use PDF, XLSX, or CSV.")
+
+        # Log warnings for default values
+        for key, value in result.items():
+            if value == DEFAULT_PARAMS[key]:
+                logger.warning(f"Using default value for {key}: {value}")
+
+        # Validate extracted values
+        for key, value in result.items():
+            if not isinstance(value, (int, float)) or value < 0:
+                logger.warning(f"Invalid value for {key}: {value}. Using default: {DEFAULT_PARAMS[key]}")
+                result[key] = DEFAULT_PARAMS[key]
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Failed to parse SEC file: {str(e)}")
+        return {'error': str(e)}
+    
+@csrf_exempt
+@require_POST
+def fetch_sec_data_endpoint(request):
+    try:
+        data = get_json_data(request)
+        ticker = data.get('ticker')
+        if not ticker:
+            return JsonResponse({'error': 'Ticker symbol is required'}, status=400)
+
+        financial_data = fetch_sec_data(ticker)
+        if 'error' in financial_data:
+            return JsonResponse({'error': financial_data['error']}, status=400)
+
+        return JsonResponse(financial_data)
+    except Exception as e:
+        logger.error(f"Fetch SEC data endpoint error: {str(e)}")
+        return JsonResponse({'error': str(e)}, status=400)
+
+@csrf_exempt
+@require_POST
+def upload_sec_data(request):
+    try:
+        ticker = request.POST.get('ticker', '')
+        file = request.FILES.get('file')
+        if not file:
+            return JsonResponse({'error': 'No file uploaded'}, status=400)
+
+        # Validate file size
+        max_size = settings.DATA_UPLOAD_MAX_MEMORY_SIZE
+        if file.size > max_size:
+            return JsonResponse({'error': f'File size exceeds limit of {max_size / (1024 * 1024)}MB'}, status=400)
+
+        financial_data = parse_sec_file(file, ticker)
+        if 'error' in financial_data:
+            return JsonResponse({'error': financial_data['error']}, status=400)
+
+        return JsonResponse(financial_data)
+    except Exception as e:
+        logger.error(f"Upload SEC data endpoint error: {str(e)}")
+        return JsonResponse({'error': f"Failed to process file: {str(e)}"}, status=400)
+    
 def generate_csv_response(metrics):
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        'Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV', 
+        'Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV',
         'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
-        'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury', 
+        'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury',
         'Profit Margin', 'Savings', 'Reduced Risk', 'ROE Uplift',
         'Bull Case BTC Price', 'Bull Case NAV Impact', 'Bull Case LTV', 'Bull Case Probability',
         'Base Case BTC Price', 'Base Case NAV Impact', 'Base Case LTV', 'Base Case Probability',
         'Bear Case BTC Price', 'Bear Case NAV Impact', 'Bear Case LTV', 'Bear Case Probability',
         'Stress Test BTC Price', 'Stress Test NAV Impact', 'Stress Test LTV', 'Stress Test Probability',
-        # New distribution_metrics fields
-        'Bull Market Probability', 'Bear Market Probability', 'Stress Test Probability', 
+        'Bull Market Probability', 'Bear Market Probability', 'Stress Test Probability',
         'Normal Market Probability', 'Value at Risk 95%', 'Expected Shortfall',
-        'Price Distribution Mean', 'Price Distribution Std Dev', 'Price Distribution Min', 
-        'Price Distribution Max', 'Price Distribution 5th Percentile', 
+        'Price Distribution Mean', 'Price Distribution Std Dev', 'Price Distribution Min',
+        'Price Distribution Max', 'Price Distribution 5th Percentile',
         'Price Distribution 25th Percentile', 'Price Distribution 50th Percentile',
         'Price Distribution 75th Percentile', 'Price Distribution 95th Percentile'
     ])
@@ -93,11 +332,11 @@ def generate_csv_response(metrics):
         f"{metrics['dilution']['avg_dilution']:.4f}",
         f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['target_metrics']['target_ltv']:.4f}",
         f"{metrics['roe']['avg_roe']:.4f}", f"{metrics['target_metrics']['target_roe']:.4f}",
-        f"{metrics['preferred_bundle']['bundle_value']:.2f}", 
+        f"{metrics['preferred_bundle']['bundle_value']:.2f}",
         f"{metrics['target_metrics']['target_bundle_value']:.2f}",
         metrics['term_sheet']['structure'], f"{metrics['term_sheet']['amount']:.2f}",
         f"{metrics['term_sheet']['rate']:.4f}", f"{metrics['term_sheet']['btc_bought']:.2f}",
-        f"{metrics['term_sheet']['total_btc_treasury']:.2f}", 
+        f"{metrics['term_sheet']['total_btc_treasury']:.2f}",
         f"{metrics['term_sheet']['profit_margin']:.4f}",
         f"{metrics['business_impact']['savings']:.2f}",
         f"{metrics['business_impact']['reduced_risk']:.4f}",
@@ -118,7 +357,6 @@ def generate_csv_response(metrics):
         f"{metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%",
         f"{metrics['scenario_metrics']['Stress Test']['ltv_ratio']:.4f}",
         f"{metrics['scenario_metrics']['Stress Test']['probability']:.2f}",
-        # New distribution_metrics values
         f"{metrics['distribution_metrics']['bull_market_prob']:.4f}",
         f"{metrics['distribution_metrics']['bear_market_prob']:.4f}",
         f"{metrics['distribution_metrics']['stress_test_prob']:.4f}",
@@ -148,7 +386,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
     y = 750
     c.drawString(100, y, title)
     y -= 30
-    
+
     items = [
         f"Average NAV: {metrics['nav']['avg_nav']:.2f}",
         f"Target NAV: {metrics['target_metrics']['target_nav']:.2f}",
@@ -184,7 +422,6 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Stress Test NAV Impact: {metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%",
         f"Stress Test LTV: {metrics['scenario_metrics']['Stress Test']['ltv_ratio']:.4f}",
         f"Stress Test Probability: {metrics['scenario_metrics']['Stress Test']['probability']:.2f}",
-        # New distribution_metrics fields
         f"Bull Market Probability: {metrics['distribution_metrics']['bull_market_prob']:.4f}",
         f"Bear Market Probability: {metrics['distribution_metrics']['bear_market_prob']:.4f}",
         f"Stress Test Probability: {metrics['distribution_metrics']['stress_test_prob']:.4f}",
@@ -201,7 +438,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Price Distribution 75th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['75th']:.2f}",
         f"Price Distribution 95th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}"
     ]
-    
+
     for item in items:
         c.drawString(100, y, item)
         y -= 20
@@ -209,7 +446,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
             c.showPage()
             c.setFont("Helvetica", 12)
             y = 750
-    
+
     c.showPage()
     c.save()
     pdf = buffer.getvalue()
@@ -225,11 +462,11 @@ def calculate(request):
     params = {}
     try:
         data = get_json_data(request)
-        initial_params = {k: float(data.get('assumptions', {}).get(k, v)) if k != 'paths' else int(data.get('assumptions', {}).get(k, v)) 
+        initial_params = {k: float(data.get('assumptions', {}).get(k, v)) if k != 'paths' else int(data.get('assumptions', {}).get(k, v))
                          for k, v in DEFAULT_PARAMS.items()}
         initial_params['export_format'] = data.get('format', 'json').lower()
         initial_params['use_live'] = data.get('use_live', False)
-        
+
         validate_inputs(initial_params)
         if initial_params['use_live']:
             btc_price = fetch_btc_price()
@@ -241,20 +478,20 @@ def calculate(request):
         logger.info("--- Starting Pass 1 (Generate Advice) ---")
         btc_prices_pass1, vol_heston_pass1 = simulate_btc_paths(initial_params)
         optimized_params = optimize_for_corporate_treasury(initial_params, btc_prices_pass1, vol_heston_pass1)
-        
+
         if optimized_params:
             advice_params = initial_params.copy()
             advice_params.update(optimized_params)
             response_data_pass1 = calculate_metrics(advice_params, btc_prices_pass1, vol_heston_pass1)
         else:
             response_data_pass1 = calculate_metrics(initial_params, btc_prices_pass1, vol_heston_pass1)
-        
+
         optimized_advice = response_data_pass1['term_sheet']
         optimized_loan_amount = optimized_advice['amount']
         optimized_btc_to_buy = optimized_advice['btc_bought']
         optimized_loan_rate = optimized_advice['rate']
         optimized_ltv_cap = optimized_advice['ltv_cap']
-        
+
         logger.info(f"Pass 1 Advice: Borrow ${optimized_loan_amount:.2f} at {optimized_loan_rate:.4%} to buy {optimized_btc_to_buy:.2f} BTC with LTV cap {optimized_ltv_cap:.4f}")
 
         logger.info("--- Starting Pass 2 (Project Stable State) ---")
@@ -269,7 +506,7 @@ def calculate(request):
 
         final_response_data = response_data_pass2
         final_response_data['term_sheet'] = optimized_advice
-        
+
         logger.info("--- Final Report Generated ---")
         logger.info(f"Final NAV: {final_response_data['nav']['avg_nav']:.2f}")
         logger.info(f"Final LTV: {final_response_data['ltv']['avg_ltv']:.4f}")
@@ -281,7 +518,7 @@ def calculate(request):
         elif initial_params['export_format'] == 'pdf':
             return generate_pdf_response(final_response_data)
         return JsonResponse(final_response_data)
-    
+
     except Exception as e:
         logger.error(f"Calculate endpoint error: {str(e)}")
         error_response = f"Error: {str(e)}"
@@ -291,7 +528,7 @@ def calculate(request):
         elif export_format == 'pdf':
             return HttpResponse(error_response, content_type='text/plain', status=400)
         return JsonResponse({'error': str(e)}, status=400)
-    
+
 @csrf_exempt
 @require_POST
 def what_if(request):
@@ -300,14 +537,14 @@ def what_if(request):
         param = data.get('param')
         value = data.get('value')
         assumptions = data.get('assumptions', {})
-        params = {k: float(assumptions.get(k, v)) if k != 'paths' else int(assumptions.get(k, v)) 
+        params = {k: float(assumptions.get(k, v)) if k != 'paths' else int(assumptions.get(k, v))
                   for k, v in DEFAULT_PARAMS.items()}
         params['export_format'] = data.get('format', 'json').lower()
         params['use_live'] = data.get('use_live', False)
-        
+
         if not param or value is None:
             raise ValueError("Both 'param' and 'value' must be provided")
-        
+
         validate_inputs(params)
         if params['use_live']:
             btc_price = fetch_btc_price()
@@ -315,13 +552,13 @@ def what_if(request):
                 params['BTC_current_market_price'] = btc_price
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
-        
+
         optimized_param = None
         optimization_type = None
-        
+
         logger.info("--- Starting What-If Pass 1 (Generate Advice) ---")
         btc_prices_pass1, vol_heston_pass1 = simulate_btc_paths(params, seed=42)
-        
+
         if value in ['optimize', 'maximize'] or (param == 'optimize_all' and value == 'corporate_treasury'):
             if param == 'LTV_Cap' and value == 'optimize':
                 optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
@@ -330,28 +567,28 @@ def what_if(request):
                     optimized_param = {'LTV_Cap': params['LTV_Cap']}
                     optimization_type = 'LTV optimization'
                     logger.info(f"Optimized LTV_Cap: {params['LTV_Cap']}")
-            
+
             elif param == 'beta_ROE' and value == 'maximize':
                 optimized_params = optimize_for_roe(params, btc_prices_pass1, vol_heston_pass1)
                 if optimized_params:
                     params['beta_ROE'] = optimized_params.get('beta_ROE', params['beta_ROE'])
                     optimized_param = {'beta_ROE': params['beta_ROE']}
                     optimization_type = 'ROE maximization'
-            
+
             elif param == 'LoanPrincipal' and value == 'optimize':
                 optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
                 if optimized_params:
                     params['LoanPrincipal'] = optimized_params['LoanPrincipal']
                     optimized_param = {'LoanPrincipal': params['LoanPrincipal']}
                     optimization_type = 'Loan amount optimization'
-            
+
             elif param == 'cost_of_debt' and value == 'optimize':
                 optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
                 if optimized_params:
                     params['cost_of_debt'] = optimized_params['cost_of_debt']
                     optimized_param = {'cost_of_debt': params['cost_of_debt']}
                     optimization_type = 'Interest rate optimization'
-            
+
             elif param == 'optimize_all' and value == 'corporate_treasury':
                 optimized_params = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
                 if optimized_params:
@@ -359,47 +596,46 @@ def what_if(request):
                     optimized_param = optimized_params
                     optimization_type = 'Corporate treasury optimization'
                     logger.info(f"Corporate treasury optimization: {optimized_params}")
-            
+
             else:
                 raise ValueError(f"Invalid optimization for param {param} with value {value}")
-        
+
         else:
             try:
                 params[param] = float(value)
             except ValueError:
                 raise ValueError(f"Value for {param} must be a number, got {value}")
-        
+
         response_data_pass1 = calculate_metrics(params, btc_prices_pass1, vol_heston_pass1)
         optimized_advice = response_data_pass1['term_sheet']
-        
+
         logger.info("--- Starting What-If Pass 2 (Project Stable State) ---")
         stable_state_params = params.copy()
         stable_state_params['LoanPrincipal'] = optimized_advice['amount']
         stable_state_params['cost_of_debt'] = optimized_advice['rate']
         stable_state_params['LTV_Cap'] = optimized_advice['ltv_cap']
         stable_state_params['BTC_purchased'] = optimized_advice['btc_bought']
-        
+
         btc_prices_pass2, vol_heston_pass2 = simulate_btc_paths(stable_state_params, seed=43)
         response_data_pass2 = calculate_metrics(stable_state_params, btc_prices_pass2, vol_heston_pass2)
-        
+
         final_response_data = response_data_pass2
         final_response_data['term_sheet'] = optimized_advice
         if optimized_param:
             final_response_data['optimized_param'] = optimized_param
         if optimization_type:
             final_response_data['optimization_type'] = optimization_type
-        
+
         if params['export_format'] == 'csv':
             return generate_csv_response(final_response_data)
         elif params['export_format'] == 'pdf':
             return generate_pdf_response(final_response_data, title="What-If Analysis Report")
         return JsonResponse(final_response_data)
-    
+
     except Exception as e:
         logger.error(f"What-If endpoint error: {str(e)}")
         return JsonResponse({'error': str(e)}, status=400)
-        
-# Additional helper function for ROE optimization
+
 def optimize_for_roe(params, btc_prices, vol_heston):
     """
     Specialized optimization for ROE maximization
@@ -409,16 +645,16 @@ def optimize_for_roe(params, btc_prices, vol_heston):
         temp_params['beta_ROE'] = beta
         metrics = calculate_metrics(temp_params, btc_prices, vol_heston)
         return -metrics['roe']['avg_roe']  # Negative for minimization
-    
+
     try:
         result = minimize_scalar(roe_objective, bounds=(1.0, 5.0), method='bounded')
         if result.success:
             return {'beta_ROE': result.x}
     except Exception as e:
         logger.error(f"ROE optimization failed: {str(e)}")
-    
+
     return None
-    
+
 @csrf_exempt
 def get_btc_price(request):
     try:
@@ -429,4 +665,3 @@ def get_btc_price(request):
     except Exception as e:
         logger.error(f"Get BTC price error: {str(e)}")
         return JsonResponse({'error': str(e)}, status=500)
-    
