@@ -314,7 +314,9 @@ def generate_csv_response(metrics):
     writer = csv.writer(output)
     writer.writerow([
         'Projected BTC Holdings Value',
-        'Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV',
+        'Average NAV', 'Target NAV',
+        'Base Dilution', 'BTC-Backed Loan Dilution', 'Convertible Note Dilution', 'Hybrid Structure Dilution',  # Added new dilution metrics
+        'Average LTV', 'Target LTV',
         'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
         'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury',
         'Profit Margin', 'Savings', 'Reduced Risk', 'ROE Uplift',
@@ -328,12 +330,15 @@ def generate_csv_response(metrics):
         'Price Distribution Max', 'Price Distribution 5th Percentile',
         'Price Distribution 25th Percentile', 'Price Distribution 50th Percentile',
         'Price Distribution 75th Percentile', 'Price Distribution 95th Percentile',
-        'Annual Burn Rate', 'Runway Months'  # Added runway metrics
+        'Annual Burn Rate', 'Runway Months'
     ])
     writer.writerow([
         f"${metrics['btc_holdings']['total_value']:.2f}",
         f"{metrics['nav']['avg_nav']:.2f}", f"{metrics['target_metrics']['target_nav']:.2f}",
-        f"{metrics['dilution']['avg_dilution']:.4f}",
+        f"{metrics['dilution']['base_dilution']:.4f}",  # Base dilution
+        f"{metrics['dilution']['avg_btc_loan_dilution']:.4f}",  # BTC-Backed Loan dilution
+        f"{metrics['dilution']['avg_convertible_dilution']:.4f}",  # Convertible Note dilution
+        f"{metrics['dilution']['avg_hybrid_dilution']:.4f}",  # Hybrid Structure dilution
         f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['target_metrics']['target_ltv']:.4f}",
         f"{metrics['roe']['avg_roe']:.4f}", f"{metrics['target_metrics']['target_roe']:.4f}",
         f"{metrics['preferred_bundle']['bundle_value']:.2f}",
@@ -376,8 +381,8 @@ def generate_csv_response(metrics):
         f"{metrics['distribution_metrics']['price_distribution']['percentiles']['50th']:.2f}",
         f"{metrics['distribution_metrics']['price_distribution']['percentiles']['75th']:.2f}",
         f"{metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}",
-        f"${metrics['runway']['annual_burn_rate']:.2f}",  # Added runway metric
-        f"{metrics['runway']['runway_months']:.2f}"       # Added runway metric
+        f"${metrics['runway']['annual_burn_rate']:.2f}",
+        f"{metrics['runway']['runway_months']:.2f}"
     ])
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="metrics.csv"'
@@ -397,7 +402,10 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Projected BTC Holdings Value: ${metrics['btc_holdings']['total_value']:.2f}",
         f"Average NAV: {metrics['nav']['avg_nav']:.2f}",
         f"Target NAV: {metrics['target_metrics']['target_nav']:.2f}",
-        f"Average Dilution: {metrics['dilution']['avg_dilution']:.4f}",
+        f"Base Dilution: {metrics['dilution']['base_dilution']:.4f}",  # Added base dilution
+        f"BTC-Backed Loan Dilution: {metrics['dilution']['avg_btc_loan_dilution']:.4f}",  # Added BTC-Backed Loan dilution
+        f"Convertible Note Dilution: {metrics['dilution']['avg_convertible_dilution']:.4f}",  # Added Convertible Note dilution
+        f"Hybrid Structure Dilution: {metrics['dilution']['avg_hybrid_dilution']:.4f}",  # Added Hybrid Structure dilution
         f"Average LTV: {metrics['ltv']['avg_ltv']:.4f}",
         f"Target LTV: {metrics['target_metrics']['target_ltv']:.4f}",
         f"Average ROE: {metrics['roe']['avg_roe']:.4f}",
@@ -444,8 +452,8 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Price Distribution 50th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['50th']:.2f}",
         f"Price Distribution 75th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['75th']:.2f}",
         f"Price Distribution 95th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}",
-        f"Annual Burn Rate: ${metrics['runway']['annual_burn_rate']:.2f}",  # Added runway metric
-        f"Runway Months: {metrics['runway']['runway_months']:.2f}"          # Added runway metric
+        f"Annual Burn Rate: ${metrics['runway']['annual_burn_rate']:.2f}",
+        f"Runway Months: {metrics['runway']['runway_months']:.2f}"
     ]
 
     for item in items:

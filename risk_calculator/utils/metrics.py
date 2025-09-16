@@ -13,21 +13,19 @@ def calculate_metrics(params, btc_prices, vol_heston):
     CollateralValue_t = total_btc * final_btc_prices  # Shape: (N,)
     base_dilution = params['new_equity_raised'] / (params['initial_equity_value'] + params['new_equity_raised'])
     
-    # NAV calculation for each path (using terminal prices)
+    # NAV calculation for each path
     nav_paths = [(total_btc * p + total_btc * p * params['delta'] - params['LoanPrincipal'] * params['cost_of_debt']) / 
                  (params['initial_equity_value'] + params['new_equity_raised']) for p in final_btc_prices]
     nav_paths = np.array(nav_paths)  # Shape: (N,)
-    dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * params['IssuePrice'], nav, params['dilution_vol_estimate'] * np.sqrt(params['t']))) 
-                     for nav in nav_paths]
-    dilution_paths = np.array(dilution_paths)  # Shape: (N,)
-
-    avg_nav = np.mean(nav_paths)
-    ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(N)
-    erosion_prob = np.mean(nav_paths < 0.9 * avg_nav)
-    avg_dilution = np.mean(dilution_paths)
-    ci_dilution = 1.96 * np.std(dilution_paths) / np.sqrt(N)
     
-    # Convertible value using terminal prices and volatilities
+    # Dilution calculations for each structure
+    # 1. BTC-Backed Loan
+    btc_loan_dilution = params['new_equity_raised'] / (params['initial_equity_value'] + params['new_equity_raised'])
+    btc_loan_dilution_paths = [btc_loan_dilution * (1 + params['dilution_vol_estimate'] * np.random.normal(0, 1)) 
+                              for _ in range(N)]
+    avg_btc_loan_dilution = np.mean(btc_loan_dilution_paths)
+    
+    # 2. Convertible Note
     S = final_btc_prices * total_btc  # Shape: (N,)
     vol_last = vol_heston[:, -1]  # Shape: (N,)
     if np.any(vol_last == 0):
@@ -36,6 +34,34 @@ def calculate_metrics(params, btc_prices, vol_heston):
     d2 = d1 - vol_last * np.sqrt(params['t'])
     convertible_value = S * norm.cdf(d1) - params['IssuePrice'] * np.exp(-(params['risk_free_rate'] + params['delta']) * params['t']) * norm.cdf(d2)
     avg_convertible_value = np.mean(convertible_value)
+    conversion_ratio = params['LoanPrincipal'] / params['IssuePrice'] if params['IssuePrice'] > 0 else 0
+    convertible_dilution = conversion_ratio / (params['initial_equity_value'] / params['IssuePrice'] + conversion_ratio)
+    convertible_dilution_paths = [convertible_dilution * (1 + params['dilution_vol_estimate'] * np.random.normal(0, 1)) 
+                                 for _ in range(N)]
+    avg_convertible_dilution = np.mean(convertible_dilution_paths)
+    
+    # 3. Hybrid Structure (50% loan, 50% convertible)
+    hybrid_loan_component = 0.5 * params['LoanPrincipal']
+    hybrid_convertible_component = 0.5 * params['LoanPrincipal']
+    hybrid_loan_dilution = hybrid_loan_component / (params['initial_equity_value'] + params['new_equity_raised'])
+    hybrid_conversion_ratio = hybrid_convertible_component / params['IssuePrice'] if params['IssuePrice'] > 0 else 0
+    hybrid_convertible_dilution = hybrid_conversion_ratio / (params['initial_equity_value'] / params['IssuePrice'] + hybrid_conversion_ratio)
+    hybrid_dilution = 0.5 * hybrid_loan_dilution + 0.5 * hybrid_convertible_dilution
+    hybrid_dilution_paths = [hybrid_dilution * (1 + params['dilution_vol_estimate'] * np.random.normal(0, 1)) 
+                            for _ in range(N)]
+    avg_hybrid_dilution = np.mean(hybrid_dilution_paths)
+    
+    # General dilution (used as fallback)
+    dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * params['IssuePrice'], nav, params['dilution_vol_estimate'] * np.sqrt(params['t']))) 
+                     for nav in nav_paths]
+    dilution_paths = np.array(dilution_paths)  # Shape: (N,)
+    avg_dilution = np.mean(dilution_paths)
+    ci_dilution = 1.96 * np.std(dilution_paths) / np.sqrt(N)
+    
+    # NAV metrics
+    avg_nav = np.mean(nav_paths)
+    ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(N)
+    erosion_prob = np.mean(nav_paths < 0.9 * avg_nav)
     
     # LTV calculation for each path
     ltv_paths = params['LoanPrincipal'] / (total_btc * final_btc_prices)  # Shape: (N,)
@@ -161,17 +187,11 @@ def calculate_metrics(params, btc_prices, vol_heston):
         }
     }
 
-    # --- NEW: Runway calculation ---
-    # cash_on_hand = equity (initial) + new equity raised
+    # Runway calculation
     cash_on_hand = params.get('initial_equity_value', 0) + params.get('new_equity_raised', 0)
-    # default annual_burn_rate fallback (e.g., $12,000,000/year -> $1,000,000/month)
     annual_burn_rate = params.get('annual_burn_rate', 12_000_000)
     monthly_burn = annual_burn_rate / 12 if annual_burn_rate > 0 else 0
-
-    if monthly_burn > 0:
-        runway_months = cash_on_hand / monthly_burn
-    else:
-        runway_months = float("inf")
+    runway_months = cash_on_hand / monthly_burn if monthly_burn > 0 else float("inf")
 
     runway = {
         'annual_burn_rate': annual_burn_rate,
@@ -184,6 +204,9 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'dilution': {
             'base_dilution': base_dilution,
             'avg_dilution': avg_dilution,
+            'avg_btc_loan_dilution': avg_btc_loan_dilution,
+            'avg_convertible_dilution': avg_convertible_dilution,
+            'avg_hybrid_dilution': avg_hybrid_dilution,
             'ci_lower': avg_dilution - ci_dilution,
             'ci_upper': avg_dilution + ci_dilution,
             'structure_threshold_breached': base_dilution >= 0.1
@@ -208,6 +231,6 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'runway': runway
     }
 
-    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}, base_dilution={base_dilution:.4f}, total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}, runway_months={runway_months:.2f}")
+    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}, base_dilution={base_dilution:.4f}, btc_loan_dilution={avg_btc_loan_dilution:.4f}, convertible_dilution={avg_convertible_dilution:.4f}, hybrid_dilution={avg_hybrid_dilution:.4f}, total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}, runway_months={runway_months:.2f}")
 
     return response_data
