@@ -71,28 +71,30 @@ def fetch_btc_price():
         return None
 
 def validate_inputs(params):
+    errors = []
     if params['long_run_volatility'] == 0:
-        raise ValueError("long_run_volatility cannot be zero to avoid division by zero")
-    if any(params[k] <= 0 for k in ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice']):
-        raise ValueError("initial_equity_value, BTC_current_market_price, BTC_treasury, and targetBTCPrice must be positive")
+        errors.append("long_run_volatility cannot be zero to avoid division by zero")
+    if any(params[k] <= 0 for k in ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice', 'IssuePrice', 'LoanPrincipal']):
+        errors.append("initial_equity_value, BTC_current_market_price, BTC_treasury, targetBTCPrice, IssuePrice, and LoanPrincipal must be positive")
     if params['BTC_purchased'] < 0:
-        raise ValueError("BTC_purchased cannot be negative")
+        errors.append("BTC_purchased cannot be negative")
     if params['paths'] < 1:
-        raise ValueError("paths must be at least 1")
+        errors.append("paths must be at least 1")
+    if params['min_profit_margin'] <= 0:
+        errors.append("min_profit_margin must be positive")
+    if errors:
+        raise ValueError("; ".join(errors))
 
 def fetch_sec_data(ticker):
-    """
-    Fetch financial data for a given ticker using Alpha Vantage API with retry logic.
-    """
     try:
         api_key = settings.ALPHA_VANTAGE_API_KEY
         if not api_key:
             raise ValueError("Alpha Vantage API key is invalid or missing. Check your .env file.")
 
         @retry(
-            stop=stop_after_attempt(3),  # Retry up to 3 times
-            wait=wait_exponential(multiplier=1, min=4, max=10),  # Exponential backoff: 4s, 8s, 10s
-            retry=retry_if_exception_type(requests.exceptions.RequestException),  # Retry on network errors
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=4, max=10),
+            retry=retry_if_exception_type(requests.exceptions.RequestException),
             before_sleep=lambda retry_state: logger.warning(
                 f"Retrying Alpha Vantage API call (attempt {retry_state.attempt_number})..."
             )
@@ -100,20 +102,20 @@ def fetch_sec_data(ticker):
         def make_api_call():
             url = f'https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={ticker}&apikey={api_key}'
             response = requests.get(url)
-            response.raise_for_status()  # Raise exception for 4xx/5xx errors
+            response.raise_for_status()
             return response.json()
 
         data = make_api_call()
 
         if 'annualReports' not in data:
             if 'Information' in data and 'API rate limit' in data['Information']:
-                raise ValueError("Alpha Vantage API rate limit exceeded. Please try again later.")
+                raise ValueError("Alpha Vantage API rate limit exceeded. Please try again in 60 seconds.")
             raise ValueError(f"No data found for ticker {ticker}")
 
         latest_report = data['annualReports'][0]
         total_equity = float(latest_report.get('totalShareholderEquity', 0))
         total_debt = float(latest_report.get('longTermDebt', 0))
-        new_equity_raised = float(latest_report.get('capitalStock', 0))  # Approximation
+        new_equity_raised = float(latest_report.get('capitalStock', 0))
 
         return {
             'initial_equity_value': total_equity if total_equity > 0 else DEFAULT_PARAMS['initial_equity_value'],
@@ -123,28 +125,26 @@ def fetch_sec_data(ticker):
     except Exception as e:
         logger.error(f"Failed to fetch SEC data for {ticker}: {str(e)}")
         return {'error': str(e)}
-    
-def parse_sec_file(file, ticker):
-    """
-    Parse uploaded SEC filing (PDF, XLSX, CSV, Docx) to extract financial metrics with enhanced parsing and validation.
-    """
-    try:
-        # Initialize result dictionary
-        result = {
-    'initial_equity_value': DEFAULT_PARAMS['initial_equity_value'],
-    'LoanPrincipal': DEFAULT_PARAMS['LoanPrincipal'],
-    'new_equity_raised': DEFAULT_PARAMS['new_equity_raised']
-}
 
-        if file.name.endswith('.pdf'):
+def parse_sec_file(file, ticker):
+    try:
+        result = {
+            'initial_equity_value': DEFAULT_PARAMS['initial_equity_value'],
+            'LoanPrincipal': DEFAULT_PARAMS['LoanPrincipal'],
+            'new_equity_raised': DEFAULT_PARAMS['new_equity_raised']
+        }
+
+        file_extension = file.name.split('.')[-1].lower()
+        if file_extension not in ['pdf', 'xlsx', 'csv', 'docx']:
+            raise ValueError(f"Unsupported file format: {file_extension}. Supported formats are PDF, XLSX, CSV, DOCX.")
+
+        if file_extension == 'pdf':
             with pdfplumber.open(file) as pdf:
-                # Try table extraction first
                 for page in pdf.pages:
                     tables = page.extract_tables()
                     for table in tables:
                         for row in table:
                             row_text = ' '.join(str(cell) for cell in row if cell)
-                            # Enhanced regex patterns
                             patterns = {
                                 'initial_equity_value': [
                                     r"Total\s+Shareholders?\s+Equity\s+[\$]?([\d,]+(?:\.\d+)?)",
@@ -175,7 +175,6 @@ def parse_sec_file(file, ticker):
                                         except ValueError:
                                             logger.warning(f"Invalid number format for {key} in table: {match.group(1)}")
 
-                # Fallback to text extraction with spaCy if table extraction fails
                 if not any(result[key] != DEFAULT_PARAMS[key] for key in result):
                     text = ''
                     for page in pdf.pages:
@@ -197,16 +196,14 @@ def parse_sec_file(file, ticker):
                             except ValueError:
                                 logger.warning(f"Invalid number format in spaCy entity: {ent_text}")
 
-        elif file.name.endswith('.xlsx') or file.name.endswith('.csv'):
-            # Read file in chunks to optimize memory
+        elif file_extension in ['xlsx', 'csv']:
             chunksize = 1000
-            if file.name.endswith('.xlsx'):
+            if file_extension == 'xlsx':
                 df_iter = pd.read_excel(file, chunksize=chunksize)
             else:
                 df_iter = pd.read_csv(file, chunksize=chunksize)
 
             for df in df_iter:
-                # Fuzzy matching for column names
                 target_columns = {
                     'initial_equity_value': ['Total Shareholder Equity', 'Shareholder Equity', 'Total Equity', 'Equity'],
                     'LoanPrincipal': ['Long-Term Debt', 'Long Term Debt', 'Total Debt', 'Liabilities'],
@@ -224,13 +221,12 @@ def parse_sec_file(file, ticker):
                             except (ValueError, TypeError):
                                 logger.warning(f"Invalid data in column {col} for {key}")
                             break
-        
-        elif file.name.endswith('.docx'):
+
+        elif file_extension == 'docx':
             doc = Document(file)
             text = ''
             for para in doc.paragraphs:
                 text += para.text + '\n'
-            # Use spaCy for entity recognition
             doc_nlp = nlp(text)
             for ent in doc_nlp.ents:
                 if ent.label_ in ['MONEY', 'CARDINAL']:
@@ -247,15 +243,11 @@ def parse_sec_file(file, ticker):
                                 result['new_equity_raised'] = value
                     except ValueError:
                         logger.warning(f"Invalid number format in DOCX entity: {ent_text}")
-        else:
-            raise ValueError("Unsupported file format. Use PDF, XLSX, or CSV.")
 
-        # Log warnings for default values
         for key, value in result.items():
             if value == DEFAULT_PARAMS[key]:
                 logger.warning(f"Using default value for {key}: {value}")
 
-        # Validate extracted values
         for key, value in result.items():
             if not isinstance(value, (int, float)) or value < 0:
                 logger.warning(f"Invalid value for {key}: {value}. Using default: {DEFAULT_PARAMS[key]}")
@@ -265,8 +257,16 @@ def parse_sec_file(file, ticker):
 
     except Exception as e:
         logger.error(f"Failed to parse SEC file: {str(e)}")
-        return {'error': str(e)}
-    
+        return {'error': f"Failed to parse {file_extension.upper()} file: {str(e)}"}
+
+@csrf_exempt
+def get_default_params(request):
+    try:
+        return JsonResponse(DEFAULT_PARAMS)
+    except Exception as e:
+        logger.error(f"Get default params error: {str(e)}")
+        return JsonResponse({'error': str(e)}, status=500)
+
 @csrf_exempt
 @require_POST
 def fetch_sec_data_endpoint(request):
@@ -294,7 +294,6 @@ def upload_sec_data(request):
         if not file:
             return JsonResponse({'error': 'No file uploaded'}, status=400)
 
-        # Validate file size
         max_size = settings.DATA_UPLOAD_MAX_MEMORY_SIZE
         if file.size > max_size:
             return JsonResponse({'error': f'File size exceeds limit of {max_size / (1024 * 1024)}MB'}, status=400)
@@ -307,7 +306,7 @@ def upload_sec_data(request):
     except Exception as e:
         logger.error(f"Upload SEC data endpoint error: {str(e)}")
         return JsonResponse({'error': f"Failed to process file: {str(e)}"}, status=400)
-    
+
 def generate_csv_response(metrics):
     output = StringIO()
     writer = csv.writer(output)
@@ -530,6 +529,17 @@ def calculate(request):
         return JsonResponse({'error': str(e)}, status=400)
 
 @csrf_exempt
+def get_btc_price(request):
+    try:
+        btc_price = fetch_btc_price()
+        if btc_price is None:
+            return JsonResponse({'error': 'Failed to fetch live BTC price'}, status=500)
+        return JsonResponse({'BTC_current_market_price': btc_price})
+    except Exception as e:
+        logger.error(f"Get BTC price error: {str(e)}")
+        return JsonResponse({'error': str(e)}, status=500)
+    
+@csrf_exempt
 @require_POST
 def what_if(request):
     try:
@@ -654,14 +664,3 @@ def optimize_for_roe(params, btc_prices, vol_heston):
         logger.error(f"ROE optimization failed: {str(e)}")
 
     return None
-
-@csrf_exempt
-def get_btc_price(request):
-    try:
-        btc_price = fetch_btc_price()
-        if btc_price is None:
-            return JsonResponse({'error': 'Failed to fetch live BTC price'}, status=500)
-        return JsonResponse({'BTC_current_market_price': btc_price})
-    except Exception as e:
-        logger.error(f"Get BTC price error: {str(e)}")
-        return JsonResponse({'error': str(e)}, status=500)
