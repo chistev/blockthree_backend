@@ -20,7 +20,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
     dilution_paths = [base_dilution * nav * (1 - norm.cdf(0.95 * params['IssuePrice'], nav, params['dilution_vol_estimate'] * np.sqrt(params['t']))) 
                      for nav in nav_paths]
     dilution_paths = np.array(dilution_paths)  # Shape: (N,)
-    
+
     avg_nav = np.mean(nav_paths)
     ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(N)
     erosion_prob = np.mean(nav_paths < 0.9 * avg_nav)
@@ -161,6 +161,23 @@ def calculate_metrics(params, btc_prices, vol_heston):
         }
     }
 
+    # --- NEW: Runway calculation ---
+    # cash_on_hand = equity (initial) + new equity raised
+    cash_on_hand = params.get('initial_equity_value', 0) + params.get('new_equity_raised', 0)
+    # default annual_burn_rate fallback (e.g., $12,000,000/year -> $1,000,000/month)
+    annual_burn_rate = params.get('annual_burn_rate', 12_000_000)
+    monthly_burn = annual_burn_rate / 12 if annual_burn_rate > 0 else 0
+
+    if monthly_burn > 0:
+        runway_months = cash_on_hand / monthly_burn
+    else:
+        runway_months = float("inf")
+
+    runway = {
+        'annual_burn_rate': annual_burn_rate,
+        'runway_months': runway_months
+    }
+
     response_data = {
         'nav': {'avg_nav': avg_nav, 'ci_lower': avg_nav - ci_nav, 'ci_upper': avg_nav + ci_nav, 
                 'erosion_prob': erosion_prob, 'nav_paths': nav_paths[:100].tolist()},
@@ -187,7 +204,10 @@ def calculate_metrics(params, btc_prices, vol_heston):
             'total_btc': total_btc,
             'total_value': total_btc_value,
             'optimized_purchase': optimized_btc
-        }
+        },
+        'runway': runway
     }
-    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}, base_dilution={base_dilution:.4f}, total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}")
+
+    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}, base_dilution={base_dilution:.4f}, total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}, runway_months={runway_months:.2f}")
+
     return response_data

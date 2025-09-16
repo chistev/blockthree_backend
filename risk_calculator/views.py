@@ -55,7 +55,8 @@ DEFAULT_PARAMS = {
     'jump_intensity': 0.1,
     'jump_mean': 0.0,
     'jump_volatility': 0.2,
-    'min_profit_margin': 0.05
+    'min_profit_margin': 0.05,
+    'annual_burn_rate': 12_000_000,  # $12M/year = $1M/month
 }
 
 def get_json_data(request):
@@ -326,7 +327,8 @@ def generate_csv_response(metrics):
         'Price Distribution Mean', 'Price Distribution Std Dev', 'Price Distribution Min',
         'Price Distribution Max', 'Price Distribution 5th Percentile',
         'Price Distribution 25th Percentile', 'Price Distribution 50th Percentile',
-        'Price Distribution 75th Percentile', 'Price Distribution 95th Percentile'
+        'Price Distribution 75th Percentile', 'Price Distribution 95th Percentile',
+        'Annual Burn Rate', 'Runway Months'  # Added runway metrics
     ])
     writer.writerow([
         f"${metrics['btc_holdings']['total_value']:.2f}",
@@ -373,7 +375,9 @@ def generate_csv_response(metrics):
         f"{metrics['distribution_metrics']['price_distribution']['percentiles']['25th']:.2f}",
         f"{metrics['distribution_metrics']['price_distribution']['percentiles']['50th']:.2f}",
         f"{metrics['distribution_metrics']['price_distribution']['percentiles']['75th']:.2f}",
-        f"{metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}"
+        f"{metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}",
+        f"${metrics['runway']['annual_burn_rate']:.2f}",  # Added runway metric
+        f"{metrics['runway']['runway_months']:.2f}"       # Added runway metric
     ])
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="metrics.csv"'
@@ -439,7 +443,9 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Price Distribution 25th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['25th']:.2f}",
         f"Price Distribution 50th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['50th']:.2f}",
         f"Price Distribution 75th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['75th']:.2f}",
-        f"Price Distribution 95th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}"
+        f"Price Distribution 95th Percentile: ${metrics['distribution_metrics']['price_distribution']['percentiles']['95th']:.2f}",
+        f"Annual Burn Rate: ${metrics['runway']['annual_burn_rate']:.2f}",  # Added runway metric
+        f"Runway Months: {metrics['runway']['runway_months']:.2f}"          # Added runway metric
     ]
 
     for item in items:
@@ -540,6 +546,7 @@ def calculate(request):
         logger.info("Pass 2: Metrics calculated")
         print("DEBUG: Pass 2 metrics calculated")
 
+        # --- Final API payload ---
         final_response_data = response_data_pass2
         final_response_data['term_sheet'] = optimized_advice
         final_response_data['btc_holdings'] = response_data_pass2.get('btc_holdings', {
@@ -548,6 +555,8 @@ def calculate(request):
             'total_btc': stable_state_params['BTC_treasury'] + stable_state_params['BTC_purchased'],
             'total_value': (stable_state_params['BTC_treasury'] + stable_state_params['BTC_purchased']) * np.mean(btc_prices_pass2[:, -1])
         })
+        # ✅ Forward runway explicitly (already included in response_data_pass2)
+        final_response_data['runway'] = response_data_pass2.get('runway', {})
 
         logger.info("--- Final Report Generated ---")
         print("DEBUG: Final Report Generated")
@@ -556,11 +565,13 @@ def calculate(request):
         logger.info(f"Final BTC Purchase: {final_response_data['term_sheet']['btc_bought']:.2f}")
         logger.info(f"Term Advice: Borrow ${final_response_data['term_sheet']['amount']:.2f}")
         logger.info(f"BTC Holdings: {final_response_data['btc_holdings']}")
+        logger.info(f"Runway: {final_response_data['runway']}")
         print(f"DEBUG: Final NAV: {final_response_data['nav']['avg_nav']:.2f}")
         print(f"DEBUG: Final LTV: {final_response_data['ltv']['avg_ltv']:.4f}")
         print(f"DEBUG: Final BTC Purchase: {final_response_data['term_sheet']['btc_bought']:.2f}")
         print(f"DEBUG: Term Advice: Borrow ${final_response_data['term_sheet']['amount']:.2f}")
         print(f"DEBUG: BTC Holdings: {final_response_data['btc_holdings']}")
+        print(f"DEBUG: Runway: {final_response_data['runway']}")
 
         if initial_params['export_format'] == 'csv':
             logger.info("Generating CSV response")
