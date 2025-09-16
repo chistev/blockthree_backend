@@ -317,6 +317,7 @@ def generate_csv_response(metrics):
         'Average NAV', 'Target NAV',
         'Base Dilution', 'BTC-Backed Loan Dilution', 'Convertible Note Dilution', 'Hybrid Structure Dilution',
         'Average LTV', 'Target LTV',
+        'BTC-Backed Loan LTV Breach Probability', 'Convertible Note LTV Breach Probability', 'Hybrid Structure LTV Breach Probability',
         'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
         'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury',
         'Profit Margin', 'Savings', 'Reduced Risk', 'ROE Uplift',
@@ -341,6 +342,9 @@ def generate_csv_response(metrics):
         f"{metrics['dilution']['avg_convertible_dilution']:.4f}",
         f"{metrics['dilution']['avg_hybrid_dilution']:.4f}",
         f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['target_metrics']['target_ltv']:.4f}",
+        f"{metrics['ltv']['exceed_prob_btc_loan']:.4f}",
+        f"{metrics['ltv']['exceed_prob_convertible']:.4f}",
+        f"{metrics['ltv']['exceed_prob_hybrid']:.4f}",
         f"{metrics['roe']['avg_roe']:.4f}", f"{metrics['target_metrics']['target_roe']:.4f}",
         f"{metrics['preferred_bundle']['bundle_value']:.2f}",
         f"{metrics['target_metrics']['target_bundle_value']:.2f}",
@@ -400,7 +404,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
     c.setFont("Helvetica", 12)
     y = 750
     c.drawString(100, y, title)
-    y -= 30
+    y -= 20
 
     items = [
         f"Projected BTC Holdings Value: ${metrics['btc_holdings']['total_value']:.2f}",
@@ -412,6 +416,9 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Hybrid Structure Dilution: {metrics['dilution']['avg_hybrid_dilution']:.4f}",
         f"Average LTV: {metrics['ltv']['avg_ltv']:.4f}",
         f"Target LTV: {metrics['target_metrics']['target_ltv']:.4f}",
+        f"BTC-Backed Loan LTV Breach Probability: {metrics['ltv']['exceed_prob_btc_loan']:.4f}",
+        f"Convertible Note LTV Breach Probability: {metrics['ltv']['exceed_prob_convertible']:.4f}",
+        f"Hybrid Structure LTV Breach Probability: {metrics['ltv']['exceed_prob_hybrid']:.4f}",
         f"Average ROE: {metrics['roe']['avg_roe']:.4f}",
         f"Target ROE: {metrics['target_metrics']['target_roe']:.4f}",
         f"Bundle Value: {metrics['preferred_bundle']['bundle_value']:.2f}",

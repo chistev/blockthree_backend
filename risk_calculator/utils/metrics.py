@@ -63,7 +63,25 @@ def calculate_metrics(params, btc_prices, vol_heston):
     ci_nav = 1.96 * np.std(nav_paths) / np.sqrt(N)
     erosion_prob = np.mean(nav_paths < 0.9 * avg_nav)
     
-    # LTV calculation for each path
+    # LTV calculation for each structure
+    # 1. BTC-Backed Loan LTV
+    btc_loan_ltv_paths = params['LoanPrincipal'] / (total_btc * final_btc_prices)  # Shape: (N,)
+    btc_loan_avg_ltv = np.mean(btc_loan_ltv_paths)
+    btc_loan_exceed_prob = np.mean(btc_loan_ltv_paths > params['LTV_Cap'])
+    
+    # 2. Convertible Note LTV
+    convertible_loan_amount = params['LoanPrincipal']  # Assume same principal for simplicity
+    convertible_ltv_paths = convertible_loan_amount / (total_btc * final_btc_prices)  # Shape: (N,)
+    convertible_avg_ltv = np.mean(convertible_ltv_paths)
+    convertible_exceed_prob = np.mean(convertible_ltv_paths > params['LTV_Cap'])
+    
+    # 3. Hybrid Structure LTV
+    hybrid_loan_amount = hybrid_loan_component  # Use the loan component only
+    hybrid_ltv_paths = hybrid_loan_amount / (total_btc * final_btc_prices)  # Shape: (N,)
+    hybrid_avg_ltv = np.mean(hybrid_ltv_paths)
+    hybrid_exceed_prob = np.mean(hybrid_ltv_paths > params['LTV_Cap'])
+    
+    # General LTV (used as fallback in the response)
     ltv_paths = params['LoanPrincipal'] / (total_btc * final_btc_prices)  # Shape: (N,)
     avg_ltv = np.mean(ltv_paths)
     ci_ltv = 1.96 * np.std(ltv_paths) / np.sqrt(N)
@@ -160,7 +178,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
             'nav_impact': nav_impact,
             'ltv_ratio': scenario_ltv,
             'probability': probability,
-            'scenario_type': 'stress_test'
+            'scenario_type': 'stress_test' if scenario_name == 'Stress Test' else scenario_name.lower()
         }
 
     # Distribution metrics using terminal prices
@@ -234,8 +252,16 @@ def calculate_metrics(params, btc_prices, vol_heston):
             'structure_threshold_breached': base_dilution >= 0.1
         },
         'convertible': {'avg_convertible': avg_convertible_value, 'ci_lower': avg_convertible_value * 0.98, 'ci_upper': avg_convertible_value * 1.02},
-        'ltv': {'avg_ltv': avg_ltv, 'ci_lower': avg_ltv - ci_ltv, 'ci_upper': avg_ltv + ci_ltv, 
-                'exceed_prob': exceed_prob, 'ltv_paths': ltv_paths[:100].tolist()},
+        'ltv': {
+            'avg_ltv': avg_ltv,
+            'ci_lower': avg_ltv - ci_ltv,
+            'ci_upper': avg_ltv + ci_ltv,
+            'exceed_prob': exceed_prob,
+            'exceed_prob_btc_loan': btc_loan_exceed_prob,
+            'exceed_prob_convertible': convertible_exceed_prob,
+            'exceed_prob_hybrid': hybrid_exceed_prob,
+            'ltv_paths': ltv_paths[:100].tolist()
+        },
         'roe': {'avg_roe': avg_roe, 'ci_lower': avg_roe - ci_roe, 'ci_upper': avg_roe + ci_roe, 'sharpe': sharpe},
         'preferred_bundle': {'bundle_value': bundle_value, 'ci_lower': bundle_value * 0.98, 'ci_upper': bundle_value * 1.02},
         'term_sheet': term_sheet,
@@ -258,6 +284,9 @@ def calculate_metrics(params, btc_prices, vol_heston):
                 f"convertible_dilution={avg_convertible_dilution:.4f}, hybrid_dilution={avg_hybrid_dilution:.4f}, "
                 f"total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}, "
                 f"runway_months={runway['runway_months']:.2f}, btc_loan_runway={btc_loan_runway:.2f}, "
-                f"convertible_runway={convertible_runway:.2f}, hybrid_runway={hybrid_runway:.2f}")
+                f"convertible_runway={convertible_runway:.2f}, hybrid_runway={hybrid_runway:.2f}, "
+                f"exceed_prob_btc_loan={btc_loan_exceed_prob:.4f}, "
+                f"exceed_prob_convertible={convertible_exceed_prob:.4f}, "
+                f"exceed_prob_hybrid={hybrid_exceed_prob:.4f}")
 
     return response_data
