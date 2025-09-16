@@ -89,7 +89,7 @@ def calculate_metrics(params, btc_prices, vol_heston):
     adjusted_savings = (base_dilution * params['initial_equity_value'] * params['BTC_current_market_price']) - avg_dilution
     roe_uplift = avg_roe - (params['expected_return_btc'] * params['beta_ROE'])
     kept_money = adjusted_savings + roe_uplift * params['initial_equity_value'] * params['BTC_current_market_price']
-    
+
     term_sheet = {
         'structure': 'Convertible Note' if base_dilution < 0.1 else 'BTC-Collateralized Loan',
         'amount': optimized_amount,
@@ -187,15 +187,37 @@ def calculate_metrics(params, btc_prices, vol_heston):
         }
     }
 
-    # Runway calculation
-    cash_on_hand = params.get('initial_equity_value', 0) + params.get('new_equity_raised', 0)
-    annual_burn_rate = params.get('annual_burn_rate', 12_000_000)
-    monthly_burn = annual_burn_rate / 12 if annual_burn_rate > 0 else 0
-    runway_months = cash_on_hand / monthly_burn if monthly_burn > 0 else float("inf")
+    # Runway calculations for each structure
+    monthly_burn = params.get('annual_burn_rate', 12_000_000) / 12 if params.get('annual_burn_rate', 12_000_000) > 0 else 0
+    cash_on_hand_base = params.get('initial_equity_value', 0) + params.get('new_equity_raised', 0)
 
+    # 1. BTC-Backed Loan Runway
+    btc_loan_cash = cash_on_hand_base + params['LoanPrincipal']  # Add loan proceeds
+    btc_loan_costs = params['LoanPrincipal'] * params['cost_of_debt']  # Annual interest cost
+    btc_loan_net_cash = btc_loan_cash - btc_loan_costs * params['t']  # Net cash after interest over time horizon
+    btc_loan_runway = btc_loan_net_cash / monthly_burn if monthly_burn > 0 else float("inf")
+
+    # 2. Convertible Note Runway
+    convertible_cash = cash_on_hand_base + params['LoanPrincipal']  # Convertible note proceeds
+    convertible_interest = params['LoanPrincipal'] * params['cost_of_debt'] * params['t']  # Interest cost
+    conversion_cost = avg_convertible_value * 0.1  # Approximate cost of dilution (adjust as needed)
+    convertible_net_cash = convertible_cash - convertible_interest - conversion_cost
+    convertible_runway = convertible_net_cash / monthly_burn if monthly_burn > 0 else float("inf")
+
+    # 3. Hybrid Structure Runway
+    hybrid_cash = cash_on_hand_base + params['LoanPrincipal']  # Hybrid proceeds
+    hybrid_loan_cost = hybrid_loan_component * params['cost_of_debt'] * params['t']  # Loan component interest
+    hybrid_convertible_cost = hybrid_convertible_component * 0.1  # Convertible component cost
+    hybrid_net_cash = hybrid_cash - hybrid_loan_cost - hybrid_convertible_cost
+    hybrid_runway = hybrid_net_cash / monthly_burn if monthly_burn > 0 else float("inf")
+
+    # Update runway dictionary to include structure-specific runways
     runway = {
-        'annual_burn_rate': annual_burn_rate,
-        'runway_months': runway_months
+        'annual_burn_rate': params.get('annual_burn_rate', 12_000_000),
+        'runway_months': cash_on_hand_base / monthly_burn if monthly_burn > 0 else float("inf"),  # Base runway
+        'btc_loan_runway_months': btc_loan_runway,
+        'convertible_runway_months': convertible_runway,
+        'hybrid_runway_months': hybrid_runway
     }
 
     response_data = {
@@ -231,6 +253,11 @@ def calculate_metrics(params, btc_prices, vol_heston):
         'runway': runway
     }
 
-    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}, base_dilution={base_dilution:.4f}, btc_loan_dilution={avg_btc_loan_dilution:.4f}, convertible_dilution={avg_convertible_dilution:.4f}, hybrid_dilution={avg_hybrid_dilution:.4f}, total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}, runway_months={runway_months:.2f}")
+    logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}, "
+                f"base_dilution={base_dilution:.4f}, btc_loan_dilution={avg_btc_loan_dilution:.4f}, "
+                f"convertible_dilution={avg_convertible_dilution:.4f}, hybrid_dilution={avg_hybrid_dilution:.4f}, "
+                f"total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}, "
+                f"runway_months={runway['runway_months']:.2f}, btc_loan_runway={btc_loan_runway:.2f}, "
+                f"convertible_runway={convertible_runway:.2f}, hybrid_runway={hybrid_runway:.2f}")
 
     return response_data
