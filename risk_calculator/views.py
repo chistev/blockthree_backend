@@ -2,6 +2,7 @@ from django.conf import settings
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt
+import numpy as np
 from scipy.optimize import minimize_scalar
 import requests
 import json
@@ -311,6 +312,7 @@ def generate_csv_response(metrics):
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow([
+        'Projected BTC Holdings Value',
         'Average NAV', 'Target NAV', 'Average Dilution', 'Average LTV', 'Target LTV',
         'Average ROE', 'Target ROE', 'Bundle Value', 'Target Bundle Value',
         'Term Structure', 'Term Amount', 'Term Rate', 'BTC Bought', 'Total BTC Treasury',
@@ -327,6 +329,7 @@ def generate_csv_response(metrics):
         'Price Distribution 75th Percentile', 'Price Distribution 95th Percentile'
     ])
     writer.writerow([
+        f"${metrics['btc_holdings']['total_value']:.2f}",
         f"{metrics['nav']['avg_nav']:.2f}", f"{metrics['target_metrics']['target_nav']:.2f}",
         f"{metrics['dilution']['avg_dilution']:.4f}",
         f"{metrics['ltv']['avg_ltv']:.4f}", f"{metrics['target_metrics']['target_ltv']:.4f}",
@@ -387,6 +390,7 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
     y -= 30
 
     items = [
+        f"Projected BTC Holdings Value: ${metrics['btc_holdings']['total_value']:.2f}",
         f"Average NAV: {metrics['nav']['avg_nav']:.2f}",
         f"Target NAV: {metrics['target_metrics']['target_nav']:.2f}",
         f"Average Dilution: {metrics['dilution']['avg_dilution']:.4f}",
@@ -460,30 +464,56 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
 def calculate(request):
     params = {}
     try:
+        logger.info("Received request to /api/calculate/ endpoint")
+        print("DEBUG: /api/calculate/ endpoint called")
+
         data = get_json_data(request)
+        logger.info("Parsed request body successfully")
+        print("DEBUG: Request body parsed")
+
         initial_params = {k: float(data.get('assumptions', {}).get(k, v)) if k != 'paths' else int(data.get('assumptions', {}).get(k, v))
                          for k, v in DEFAULT_PARAMS.items()}
         initial_params['export_format'] = data.get('format', 'json').lower()
         initial_params['use_live'] = data.get('use_live', False)
+        logger.info(f"Initial parameters set: {initial_params}")
+        print(f"DEBUG: Initial parameters: {initial_params}")
 
         validate_inputs(initial_params)
+        logger.info("Input validation passed")
+        print("DEBUG: Inputs validated")
+
         if initial_params['use_live']:
             btc_price = fetch_btc_price()
             if btc_price:
                 initial_params['BTC_current_market_price'] = btc_price
                 if initial_params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     initial_params['targetBTCPrice'] = btc_price
+                logger.info(f"Live BTC price fetched: {btc_price}")
+                print(f"DEBUG: Live BTC price set to {btc_price}")
+            else:
+                logger.warning("Failed to fetch live BTC price, using default")
+                print("DEBUG: Failed to fetch live BTC price")
 
         logger.info("--- Starting Pass 1 (Generate Advice) ---")
+        print("DEBUG: Starting Pass 1 (Generate Advice)")
         btc_prices_pass1, vol_heston_pass1 = simulate_btc_paths(initial_params)
+        logger.info("Pass 1: BTC price paths and volatility simulated")
+        print("DEBUG: Pass 1 simulation completed")
+
         optimized_params = optimize_for_corporate_treasury(initial_params, btc_prices_pass1, vol_heston_pass1)
+        logger.info(f"Pass 1: Optimization result: {optimized_params}")
+        print(f"DEBUG: Pass 1 optimization result: {optimized_params}")
 
         if optimized_params:
             advice_params = initial_params.copy()
             advice_params.update(optimized_params)
             response_data_pass1 = calculate_metrics(advice_params, btc_prices_pass1, vol_heston_pass1)
+            logger.info("Pass 1: Metrics calculated with optimized parameters")
+            print("DEBUG: Pass 1 metrics calculated with optimized params")
         else:
             response_data_pass1 = calculate_metrics(initial_params, btc_prices_pass1, vol_heston_pass1)
+            logger.info("Pass 1: Metrics calculated with initial parameters")
+            print("DEBUG: Pass 1 metrics calculated with initial params")
 
         optimized_advice = response_data_pass1['term_sheet']
         optimized_loan_amount = optimized_advice['amount']
@@ -492,8 +522,10 @@ def calculate(request):
         optimized_ltv_cap = optimized_advice['ltv_cap']
 
         logger.info(f"Pass 1 Advice: Borrow ${optimized_loan_amount:.2f} at {optimized_loan_rate:.4%} to buy {optimized_btc_to_buy:.2f} BTC with LTV cap {optimized_ltv_cap:.4f}")
+        print(f"DEBUG: Pass 1 Advice: Borrow ${optimized_loan_amount:.2f} at {optimized_loan_rate:.4%} to buy {optimized_btc_to_buy:.2f} BTC with LTV cap {optimized_ltv_cap:.4f}")
 
         logger.info("--- Starting Pass 2 (Project Stable State) ---")
+        print("DEBUG: Starting Pass 2 (Project Stable State)")
         stable_state_params = initial_params.copy()
         stable_state_params['LoanPrincipal'] = optimized_loan_amount
         stable_state_params['cost_of_debt'] = optimized_loan_rate
@@ -501,33 +533,64 @@ def calculate(request):
         stable_state_params['BTC_purchased'] = optimized_btc_to_buy
 
         btc_prices_pass2, vol_heston_pass2 = simulate_btc_paths(stable_state_params, seed=43)
+        logger.info("Pass 2: BTC price paths and volatility simulated")
+        print("DEBUG: Pass 2 simulation completed")
+
         response_data_pass2 = calculate_metrics(stable_state_params, btc_prices_pass2, vol_heston_pass2)
+        logger.info("Pass 2: Metrics calculated")
+        print("DEBUG: Pass 2 metrics calculated")
 
         final_response_data = response_data_pass2
         final_response_data['term_sheet'] = optimized_advice
+        final_response_data['btc_holdings'] = response_data_pass2.get('btc_holdings', {
+            'initial_btc': stable_state_params['BTC_treasury'],
+            'purchased_btc': stable_state_params['BTC_purchased'],
+            'total_btc': stable_state_params['BTC_treasury'] + stable_state_params['BTC_purchased'],
+            'total_value': (stable_state_params['BTC_treasury'] + stable_state_params['BTC_purchased']) * np.mean(btc_prices_pass2[:, -1])
+        })
 
         logger.info("--- Final Report Generated ---")
+        print("DEBUG: Final Report Generated")
         logger.info(f"Final NAV: {final_response_data['nav']['avg_nav']:.2f}")
         logger.info(f"Final LTV: {final_response_data['ltv']['avg_ltv']:.4f}")
         logger.info(f"Final BTC Purchase: {final_response_data['term_sheet']['btc_bought']:.2f}")
         logger.info(f"Term Advice: Borrow ${final_response_data['term_sheet']['amount']:.2f}")
+        logger.info(f"BTC Holdings: {final_response_data['btc_holdings']}")
+        print(f"DEBUG: Final NAV: {final_response_data['nav']['avg_nav']:.2f}")
+        print(f"DEBUG: Final LTV: {final_response_data['ltv']['avg_ltv']:.4f}")
+        print(f"DEBUG: Final BTC Purchase: {final_response_data['term_sheet']['btc_bought']:.2f}")
+        print(f"DEBUG: Term Advice: Borrow ${final_response_data['term_sheet']['amount']:.2f}")
+        print(f"DEBUG: BTC Holdings: {final_response_data['btc_holdings']}")
 
         if initial_params['export_format'] == 'csv':
+            logger.info("Generating CSV response")
+            print("DEBUG: Generating CSV response")
             return generate_csv_response(final_response_data)
         elif initial_params['export_format'] == 'pdf':
+            logger.info("Generating PDF response")
+            print("DEBUG: Generating PDF response")
             return generate_pdf_response(final_response_data)
+        logger.info("Returning JSON response")
+        print("DEBUG: Returning JSON response")
         return JsonResponse(final_response_data)
 
     except Exception as e:
         logger.error(f"Calculate endpoint error: {str(e)}")
+        print(f"DEBUG: Calculate endpoint error: {str(e)}")
         error_response = f"Error: {str(e)}"
         export_format = params.get('export_format', 'json') if 'params' in locals() else 'json'
         if export_format == 'csv':
+            logger.error("Error occurred, returning plain text for CSV")
+            print("DEBUG: Error occurred, returning plain text for CSV")
             return HttpResponse(error_response, content_type='text/plain', status=400)
         elif export_format == 'pdf':
+            logger.error("Error occurred, returning plain text for PDF")
+            print("DEBUG: Error occurred, returning plain text for PDF")
             return HttpResponse(error_response, content_type='text/plain', status=400)
+        logger.error("Error occurred, returning JSON error response")
+        print("DEBUG: Error occurred, returning JSON error response")
         return JsonResponse({'error': str(e)}, status=400)
-
+        
 @csrf_exempt
 def get_btc_price(request):
     try:
