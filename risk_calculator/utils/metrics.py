@@ -64,39 +64,60 @@ def calculate_metrics(params, btc_prices, vol_heston):
     erosion_prob = np.mean(nav_paths < 0.9 * avg_nav)
     
     # LTV calculation for each structure
-    # 1. BTC-Backed Loan LTV
     btc_loan_ltv_paths = params['LoanPrincipal'] / (total_btc * final_btc_prices)  # Shape: (N,)
     btc_loan_avg_ltv = np.mean(btc_loan_ltv_paths)
     btc_loan_exceed_prob = np.mean(btc_loan_ltv_paths > params['LTV_Cap'])
     
-    # 2. Convertible Note LTV
-    convertible_loan_amount = params['LoanPrincipal']  # Assume same principal for simplicity
+    convertible_loan_amount = params['LoanPrincipal']
     convertible_ltv_paths = convertible_loan_amount / (total_btc * final_btc_prices)  # Shape: (N,)
     convertible_avg_ltv = np.mean(convertible_ltv_paths)
     convertible_exceed_prob = np.mean(convertible_ltv_paths > params['LTV_Cap'])
     
-    # 3. Hybrid Structure LTV
-    hybrid_loan_amount = hybrid_loan_component  # Use the loan component only
+    hybrid_loan_amount = hybrid_loan_component
     hybrid_ltv_paths = hybrid_loan_amount / (total_btc * final_btc_prices)  # Shape: (N,)
     hybrid_avg_ltv = np.mean(hybrid_ltv_paths)
     hybrid_exceed_prob = np.mean(hybrid_ltv_paths > params['LTV_Cap'])
     
-    # General LTV (used as fallback in the response)
     ltv_paths = params['LoanPrincipal'] / (total_btc * final_btc_prices)  # Shape: (N,)
     avg_ltv = np.mean(ltv_paths)
     ci_ltv = 1.96 * np.std(ltv_paths) / np.sqrt(N)
     exceed_prob = np.mean(ltv_paths > params['LTV_Cap'])
     
-    # ROE calculation
-    roe_t = params['risk_free_rate'] + params['beta_ROE'] * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_last / params['long_run_volatility'])
-    avg_roe = np.mean(roe_t)
-    ci_roe = 1.96 * np.std(roe_t) / np.sqrt(N)
-    sharpe = (avg_roe - params['risk_free_rate']) / np.std(roe_t) if np.std(roe_t) != 0 else 0
+    # ROE calculations for each structure
+    # Base ROE using CAPM, adjusted for volatility
+    roe_base = params['risk_free_rate'] + params['beta_ROE'] * (params['expected_return_btc'] - params['risk_free_rate']) * (1 + vol_last / params['long_run_volatility'])
+    
+    # 1. BTC-Backed Loan ROE
+    # Higher leverage increases ROE but also risk
+    btc_loan_leverage = params['LoanPrincipal'] / (params['initial_equity_value'] + params['new_equity_raised'])
+    btc_loan_roe = roe_base * (1 + btc_loan_leverage * (1 - avg_btc_loan_dilution))
+    avg_roe_btc_loan = np.mean(btc_loan_roe)
+    ci_roe_btc_loan = 1.96 * np.std(btc_loan_roe) / np.sqrt(N)
+    
+    # 2. Convertible Note ROE
+    # Accounts for potential equity conversion
+    convertible_leverage = params['LoanPrincipal'] / (params['initial_equity_value'] + params['new_equity_raised'])
+    convertible_roe_adjustment = 1 - convertible_dilution * (avg_convertible_value / params['initial_equity_value'] if params['initial_equity_value'] > 0 else 0)
+    convertible_roe = roe_base * (1 + convertible_leverage * convertible_roe_adjustment)
+    avg_roe_convertible = np.mean(convertible_roe)
+    ci_roe_convertible = 1.96 * np.std(convertible_roe) / np.sqrt(N)
+    
+    # 3. Hybrid Structure ROE
+    # Balances loan and convertible components
+    hybrid_leverage = hybrid_loan_component / (params['initial_equity_value'] + params['new_equity_raised'])
+    hybrid_roe_adjustment = 1 - 0.5 * convertible_dilution * (avg_convertible_value / params['initial_equity_value'] if params['initial_equity_value'] > 0 else 0)
+    hybrid_roe = roe_base * (1 + hybrid_leverage * hybrid_roe_adjustment)
+    avg_roe_hybrid = np.mean(hybrid_roe)
+    ci_roe_hybrid = 1.96 * np.std(hybrid_roe) / np.sqrt(N)
+    
+    # General ROE (used as fallback)
+    avg_roe = np.mean(roe_base)
+    ci_roe = 1.96 * np.std(roe_base) / np.sqrt(N)
+    sharpe = (avg_roe - params['risk_free_rate']) / np.std(roe_base) if np.std(roe_base) != 0 else 0
     
     tax_rate = 0.2
     bundle_value = (0.4 * avg_nav + 0.3 * avg_dilution + 0.3 * avg_convertible_value) * (1 - tax_rate)
     
-    # Profit margin
     business_profit = (params['cost_of_debt'] - params['risk_free_rate']) * params['LoanPrincipal']
     profit_margin = business_profit / params['LoanPrincipal'] if params['LoanPrincipal'] > 0 else 0
     
@@ -181,7 +202,6 @@ def calculate_metrics(params, btc_prices, vol_heston):
             'scenario_type': 'stress_test' if scenario_name == 'Stress Test' else scenario_name.lower()
         }
 
-    # Distribution metrics using terminal prices
     distribution_metrics = {
         'bull_market_prob': np.mean(final_btc_prices >= params['BTC_current_market_price'] * 1.5),
         'bear_market_prob': np.mean(final_btc_prices <= params['BTC_current_market_price'] * 0.7),
@@ -205,34 +225,29 @@ def calculate_metrics(params, btc_prices, vol_heston):
         }
     }
 
-    # Runway calculations for each structure
     monthly_burn = params.get('annual_burn_rate', 12_000_000) / 12 if params.get('annual_burn_rate', 12_000_000) > 0 else 0
     cash_on_hand_base = params.get('initial_equity_value', 0) + params.get('new_equity_raised', 0)
 
-    # 1. BTC-Backed Loan Runway
-    btc_loan_cash = cash_on_hand_base + params['LoanPrincipal']  # Add loan proceeds
-    btc_loan_costs = params['LoanPrincipal'] * params['cost_of_debt']  # Annual interest cost
-    btc_loan_net_cash = btc_loan_cash - btc_loan_costs * params['t']  # Net cash after interest over time horizon
+    btc_loan_cash = cash_on_hand_base + params['LoanPrincipal']
+    btc_loan_costs = params['LoanPrincipal'] * params['cost_of_debt']
+    btc_loan_net_cash = btc_loan_cash - btc_loan_costs * params['t']
     btc_loan_runway = btc_loan_net_cash / monthly_burn if monthly_burn > 0 else float("inf")
 
-    # 2. Convertible Note Runway
-    convertible_cash = cash_on_hand_base + params['LoanPrincipal']  # Convertible note proceeds
-    convertible_interest = params['LoanPrincipal'] * params['cost_of_debt'] * params['t']  # Interest cost
-    conversion_cost = avg_convertible_value * 0.1  # Approximate cost of dilution (adjust as needed)
+    convertible_cash = cash_on_hand_base + params['LoanPrincipal']
+    convertible_interest = params['LoanPrincipal'] * params['cost_of_debt'] * params['t']
+    conversion_cost = avg_convertible_value * 0.1
     convertible_net_cash = convertible_cash - convertible_interest - conversion_cost
     convertible_runway = convertible_net_cash / monthly_burn if monthly_burn > 0 else float("inf")
 
-    # 3. Hybrid Structure Runway
-    hybrid_cash = cash_on_hand_base + params['LoanPrincipal']  # Hybrid proceeds
-    hybrid_loan_cost = hybrid_loan_component * params['cost_of_debt'] * params['t']  # Loan component interest
-    hybrid_convertible_cost = hybrid_convertible_component * 0.1  # Convertible component cost
+    hybrid_cash = cash_on_hand_base + params['LoanPrincipal']
+    hybrid_loan_cost = hybrid_loan_component * params['cost_of_debt'] * params['t']
+    hybrid_convertible_cost = hybrid_convertible_component * 0.1
     hybrid_net_cash = hybrid_cash - hybrid_loan_cost - hybrid_convertible_cost
     hybrid_runway = hybrid_net_cash / monthly_burn if monthly_burn > 0 else float("inf")
 
-    # Update runway dictionary to include structure-specific runways
     runway = {
         'annual_burn_rate': params.get('annual_burn_rate', 12_000_000),
-        'runway_months': cash_on_hand_base / monthly_burn if monthly_burn > 0 else float("inf"),  # Base runway
+        'runway_months': cash_on_hand_base / monthly_burn if monthly_burn > 0 else float("inf"),
         'btc_loan_runway_months': btc_loan_runway,
         'convertible_runway_months': convertible_runway,
         'hybrid_runway_months': hybrid_runway
@@ -262,7 +277,21 @@ def calculate_metrics(params, btc_prices, vol_heston):
             'exceed_prob_hybrid': hybrid_exceed_prob,
             'ltv_paths': ltv_paths[:100].tolist()
         },
-        'roe': {'avg_roe': avg_roe, 'ci_lower': avg_roe - ci_roe, 'ci_upper': avg_roe + ci_roe, 'sharpe': sharpe},
+        'roe': {
+            'avg_roe': avg_roe,
+            'avg_roe_btc_loan': avg_roe_btc_loan,
+            'avg_roe_convertible': avg_roe_convertible,
+            'avg_roe_hybrid': avg_roe_hybrid,
+            'ci_lower': avg_roe - ci_roe,
+            'ci_upper': avg_roe + ci_roe,
+            'ci_lower_btc_loan': avg_roe_btc_loan - ci_roe_btc_loan,
+            'ci_upper_btc_loan': avg_roe_btc_loan + ci_roe_btc_loan,
+            'ci_lower_convertible': avg_roe_convertible - ci_roe_convertible,
+            'ci_upper_convertible': avg_roe_convertible + ci_roe_convertible,
+            'ci_lower_hybrid': avg_roe_hybrid - ci_roe_hybrid,
+            'ci_upper_hybrid': avg_roe_hybrid + ci_roe_hybrid,
+            'sharpe': sharpe
+        },
         'preferred_bundle': {'bundle_value': bundle_value, 'ci_lower': bundle_value * 0.98, 'ci_upper': bundle_value * 1.02},
         'term_sheet': term_sheet,
         'business_impact': business_impact,
@@ -280,13 +309,13 @@ def calculate_metrics(params, btc_prices, vol_heston):
     }
 
     logger.info(f"Calculated metrics: avg_nav={avg_nav:.2f}, avg_ltv={avg_ltv:.4f}, avg_roe={avg_roe:.4f}, "
-                f"base_dilution={base_dilution:.4f}, btc_loan_dilution={avg_btc_loan_dilution:.4f}, "
-                f"convertible_dilution={avg_convertible_dilution:.4f}, hybrid_dilution={avg_hybrid_dilution:.4f}, "
-                f"total_btc={total_btc:.2f}, total_btc_value={total_btc_value:.2f}, "
-                f"runway_months={runway['runway_months']:.2f}, btc_loan_runway={btc_loan_runway:.2f}, "
-                f"convertible_runway={convertible_runway:.2f}, hybrid_runway={hybrid_runway:.2f}, "
-                f"exceed_prob_btc_loan={btc_loan_exceed_prob:.4f}, "
-                f"exceed_prob_convertible={convertible_exceed_prob:.4f}, "
-                f"exceed_prob_hybrid={hybrid_exceed_prob:.4f}")
+                f"avg_roe_btc_loan={avg_roe_btc_loan:.4f}, avg_roe_convertible={avg_roe_convertible:.4f}, "
+                f"avg_roe_hybrid={avg_roe_hybrid:.4f}, base_dilution={base_dilution:.4f}, "
+                f"btc_loan_dilution={avg_btc_loan_dilution:.4f}, convertible_dilution={avg_convertible_dilution:.4f}, "
+                f"hybrid_dilution={avg_hybrid_dilution:.4f}, total_btc={total_btc:.2f}, "
+                f"total_btc_value={total_btc_value:.2f}, runway_months={runway['runway_months']:.2f}, "
+                f"btc_loan_runway={btc_loan_runway:.2f}, convertible_runway={convertible_runway:.2f}, "
+                f"hybrid_runway={hybrid_runway:.2f}, exceed_prob_btc_loan={btc_loan_exceed_prob:.4f}, "
+                f"exceed_prob_convertible={convertible_exceed_prob:.4f}, exceed_prob_hybrid={hybrid_exceed_prob:.4f}")
 
     return response_data
