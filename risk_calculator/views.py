@@ -56,7 +56,12 @@ DEFAULT_PARAMS = {
     'jump_mean': 0.0,
     'jump_volatility': 0.2,
     'min_profit_margin': 0.05,
-    'annual_burn_rate': 12_000_000,  # $12M/year = $1M/month
+    'annual_burn_rate': 12_000_000,
+    'PIPE_discount': 0.1,
+    'PIPE_warrant_coverage': 0.2,
+    'PIPE_lockup_period': 180,
+    'ATM_issuance_cost': 0.03,
+    'ATM_daily_capacity': 0.1,
 }
 
 def get_json_data(request):
@@ -84,6 +89,16 @@ def validate_inputs(params):
         errors.append("paths must be at least 1")
     if params['min_profit_margin'] <= 0:
         errors.append("min_profit_margin must be positive")
+    if not (0 <= params['PIPE_discount'] <= 0.2):
+        errors.append("PIPE_discount must be between 0 and 0.2")
+    if not (0 <= params['PIPE_warrant_coverage'] <= 0.5):
+        errors.append("PIPE_warrant_coverage must be between 0 and 0.5")
+    if not (0 <= params['PIPE_lockup_period'] <= 365):
+        errors.append("PIPE_lockup_period must be between 0 and 365 days")
+    if not (0 <= params['ATM_issuance_cost'] <= 0.05):
+        errors.append("ATM_issuance_cost must be between 0 and 0.05")
+    if not (0 <= params['ATM_daily_capacity'] <= 0.5):
+        errors.append("ATM_daily_capacity must be between 0 and 0.5")
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -333,7 +348,8 @@ def generate_csv_response(metrics):
         'Price Distribution 25th Percentile', 'Price Distribution 50th Percentile',
         'Price Distribution 75th Percentile', 'Price Distribution 95th Percentile',
         'Annual Burn Rate', 'Runway Months (Base)', 'BTC-Backed Loan Runway Months',
-        'Convertible Note Runway Months', 'Hybrid Structure Runway Months'
+        'Convertible Note Runway Months', 'Hybrid Structure Runway Months', 'ATM Runway Extension',
+        'PIPE Effective Cost', 'PIPE Dilution Impact', 'ATM Net Proceeds', 'Effective Financing Cost'
     ])
     writer.writerow([
         f"${metrics['btc_holdings']['total_value']:.2f}",
@@ -395,7 +411,12 @@ def generate_csv_response(metrics):
         f"{metrics['runway']['runway_months']:.2f}",
         f"{metrics['runway']['btc_loan_runway_months']:.2f}",
         f"{metrics['runway']['convertible_runway_months']:.2f}",
-        f"{metrics['runway']['hybrid_runway_months']:.2f}"
+        f"{metrics['runway']['hybrid_runway_months']:.2f}",
+        f"{metrics['runway']['atm_runway_extension']:.2f}",
+        f"${metrics['financing']['pipe_effective_cost']:.2f}",
+        f"{metrics['financing']['pipe_dilution_impact']:.4f}",
+        f"${metrics['financing']['atm_net_proceeds']:.2f}",
+        f"{metrics['financing']['effective_financing_cost']:.4f}"
     ])
     response = HttpResponse(content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="metrics.csv"'
@@ -475,7 +496,12 @@ def generate_pdf_response(metrics, title="Financial Metrics Report"):
         f"Runway Months (Base): {metrics['runway']['runway_months']:.2f}",
         f"BTC-Backed Loan Runway Months: {metrics['runway']['btc_loan_runway_months']:.2f}",
         f"Convertible Note Runway Months: {metrics['runway']['convertible_runway_months']:.2f}",
-        f"Hybrid Structure Runway Months: {metrics['runway']['hybrid_runway_months']:.2f}"
+        f"Hybrid Structure Runway Months: {metrics['runway']['hybrid_runway_months']:.2f}",
+        f"ATM Runway Extension: {metrics['runway']['atm_runway_extension']:.2f} months",
+        f"PIPE Effective Cost: ${metrics['financing']['pipe_effective_cost']:.2f}",
+        f"PIPE Dilution Impact: {metrics['financing']['pipe_dilution_impact']:.4f}",
+        f"ATM Net Proceeds: ${metrics['financing']['atm_net_proceeds']:.2f}",
+        f"Effective Financing Cost: {metrics['financing']['effective_financing_cost']:.4f}"
     ]
 
     for item in items:
