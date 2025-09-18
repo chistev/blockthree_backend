@@ -16,6 +16,7 @@ import pandas as pd
 import re
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from risk_calculator.config import DEFAULT_PARAMS
 from risk_calculator.utils.metrics import calculate_metrics
 from risk_calculator.utils.optimization import optimize_for_corporate_treasury
 from risk_calculator.utils.simulation import simulate_btc_paths
@@ -29,40 +30,6 @@ nlp = spacy.load('en_core_web_sm')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-DEFAULT_PARAMS = {
-    'BTC_treasury': 1000,
-    'BTC_purchased': 0,
-    'BTC_current_market_price': 117000,
-    'targetBTCPrice': 117000,
-    'mu': 0.45,
-    'sigma': 0.55,
-    't': 1,
-    'delta': 0.08,
-    'initial_equity_value': 90000000,
-    'new_equity_raised': 5000000,
-    'IssuePrice': 117000,
-    'LoanPrincipal': 25000000,
-    'cost_of_debt': 0.06,
-    'dilution_vol_estimate': 0.55,
-    'LTV_Cap': 0.5,
-    'beta_ROE': 2.5,
-    'expected_return_btc': 0.45,
-    'risk_free_rate': 0.04,
-    'vol_mean_reversion_speed': 0.5,
-    'long_run_volatility': 0.5,
-    'paths': 10000,
-    'jump_intensity': 0.1,
-    'jump_mean': 0.0,
-    'jump_volatility': 0.2,
-    'min_profit_margin': 0.05,
-    'annual_burn_rate': 12_000_000,
-    'PIPE_discount': 0.1,
-    'PIPE_warrant_coverage': 0.2,
-    'PIPE_lockup_period': 180,
-    'ATM_issuance_cost': 0.03,
-    'ATM_daily_capacity': 0.1,
-}
 
 def get_json_data(request):
     return json.loads(request.body.decode('utf-8'))
