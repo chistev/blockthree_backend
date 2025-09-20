@@ -1,113 +1,219 @@
 import numpy as np
-from scipy.optimize import minimize
 import logging
-
-from risk_calculator.utils.metrics import calculate_metrics
+from pymoo.core.problem import ElementwiseProblem
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.optimize import minimize as pymoo_minimize
+from risk_calculator.utils.metrics import calculate_metrics, evaluate_candidate
 
 logger = logging.getLogger(__name__)
 
-def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
-    logger.info("Starting optimization for corporate treasury objectives")
+class TreasuryProblem(ElementwiseProblem):
+    """
+    Multi-objective portfolio/treasury optimizer.
+    Decision variables (x):
+        x[0] = LoanPrincipal [0, 3 * initial_equity_value]
+        x[1] = cost_of_debt [risk_free_rate, risk_free_rate + 0.15]
+        x[2] = LTV_Cap [0.10, 0.80]
+        x[3] = hedge_intensity [0.00, 1.00] (0..100% overlay notional)
+        x[4] = premium (converts only) [0.00, 0.50] (conversion premium)
+    Objectives F to minimize:
+        F[0] = - total_btc (maximize BTC added)
+        F[1] = avg_dilution (minimize expected dilution)
+        F[2] = breach_prob (minimize LTV breach probability)
+    Constraints G (must be <= 0):
+        G[0] = avg_dilution - max_dilution
+        G[1] = min_runway_months - runway_mean
+        G[2] = breach_prob - max_breach_prob
+    Notes:
+        - Uses common random numbers: metrics are evaluated on the SAME
+          btc_paths / vol paths provided in the constructor.
+        - Applies a hard penalty if profit margin falls below min_profit_margin.
+    """
+    def __init__(self, params, btc_prices, vol_heston):
+        self.params = params
+        self.btc_prices = btc_prices
+        self.vol_heston = vol_heston
+        xl = [
+            0.0,
+            params['risk_free_rate'],
+            0.10,
+            0.00,
+            0.00
+        ]
+        xu = [
+            params['initial_equity_value'] * 3.0,
+            params['risk_free_rate'] + 0.15,
+            0.80,
+            1.00,
+            0.50
+        ]
+        super().__init__(
+            n_var=5,
+            n_obj=3,
+            n_constr=3,
+            xl=xl,
+            xu=xu
+        )
 
-    def objective(x):
-        temp_params = params.copy()
-        temp_params['LoanPrincipal'] = x[0]
-        temp_params['cost_of_debt'] = x[1]
-        temp_params['LTV_Cap'] = x[2]
-        temp_params['PIPE_discount'] = x[3]
-        temp_params['PIPE_warrant_coverage'] = x[4]
-        temp_params['ATM_issuance_cost'] = x[5]
-
+    def _evaluate(self, x, out, *args, **kwargs):
+        # Build a candidate parameter set
+        p = self.params.copy()
+        p['LoanPrincipal'] = float(x[0])
+        p['cost_of_debt'] = float(x[1])
+        p['LTV_Cap'] = float(x[2])
+        p['hedge_intensity'] = float(x[3])
+        p['premium'] = float(x[4])
+        # Implied BTC purchased from principal (if relevant to structure)
+        price = max(p['BTC_current_market_price'], 1e-9)
+        p['BTC_purchased'] = p['LoanPrincipal'] / price
         try:
-            metrics = calculate_metrics(temp_params, btc_prices, vol_heston)
-
-            btc_purchasable = 0 if params['BTC_current_market_price'] == 0 else x[0] / params['BTC_current_market_price']
-
-            w_btc = 0.4
-            w_roe = 0.3
-            w_dilution = -0.1
-            w_erosion = -0.1
-            w_ltv = -0.1
-            w_profit = 0.3
-            w_pipe_cost = -0.05  # Weight for PIPE-related costs
-            w_atm_cost = -0.05  # Weight for ATM issuance costs
-
-            # Calculate effective cost of PIPE
-            effective_equity_price = params['IssuePrice'] * (1 - x[3])
-            warrant_shares = params['new_equity_raised'] * x[4] / effective_equity_price
-            pipe_cost = params['new_equity_raised'] * x[3] + warrant_shares * effective_equity_price
-
-            # Calculate ATM issuance cost
-            atm_cost = params['new_equity_raised'] * x[5]
-
-            objective_value = (
-                w_btc * btc_purchasable +
-                w_roe * metrics['business_impact']['roe_uplift'] +
-                w_dilution * metrics['dilution']['avg_dilution'] +
-                w_erosion * metrics['nav']['erosion_prob'] +
-                w_ltv * metrics['ltv']['exceed_prob'] +
-                w_profit * metrics['term_sheet']['profit_margin'] +
-                w_pipe_cost * pipe_cost +
-                w_atm_cost * atm_cost
-            )
-
-            profit_margin = metrics['term_sheet']['profit_margin']
-            if profit_margin < params['min_profit_margin']:
-                objective_value -= 1000 * (params['min_profit_margin'] - profit_margin)
-
-            return -objective_value
-
+            m = calculate_metrics(p, self.btc_prices, self.vol_heston)
+            total_btc = m['btc_holdings']['total_btc']
+            avg_dilution = m['dilution']['avg_dilution']
+            breach_prob = m['ltv']['exceed_prob']
+            runway_mean = m['runway']['dist_mean']
+            profit_margin = m['term_sheet']['profit_margin']
+            # Objective vector (minimization)
+            f0 = -float(total_btc)  # maximize BTC
+            f1 = float(avg_dilution)  # minimize dilution
+            f2 = float(breach_prob)  # minimize breach probability
+            # Constraints (<= 0 is feasible)
+            g0 = avg_dilution - self.params['max_dilution']
+            g1 = self.params['min_runway_months'] - runway_mean
+            g2 = breach_prob - self.params['max_breach_prob']
+            # Profitability penalty (keeps solutions economically meaningful)
+            if profit_margin < self.params['min_profit_margin']:
+                # Push far away in objective space and mark constraints infeasible
+                penalty = 1e6 * (self.params['min_profit_margin'] - profit_margin + 1.0)
+                f0 = penalty
+                f1 = penalty
+                f2 = penalty
+                g0 = max(g0, 1.0)  # make infeasible
+                g1 = max(g1, 1.0)
+                g2 = max(g2, 1.0)
+            out['F'] = [f0, f1, f2]
+            out['G'] = [g0, g1, g2]
         except Exception as e:
-            logger.error(f"Objective function error: {str(e)}")
-            return float('inf')
+            # Numerical guardrail: on any exception, return a dominated, infeasible point
+            logger.debug(f"Objective evaluation failed: {e}")
+            out['F'] = [1e9, 1e9, 1e9]
+            out['G'] = [1e9, 1e9, 1e9]
 
-    x0 = np.array([
-        params['LoanPrincipal'],
-        params['cost_of_debt'],
-        params['LTV_Cap'],
-        params['PIPE_discount'],
-        params['PIPE_warrant_coverage'],
-        params['ATM_issuance_cost']
-    ])
-    bounds = [
-        (0, params['initial_equity_value'] * 3),
-        (params['risk_free_rate'], params['risk_free_rate'] + 0.15),
-        (0.1, 0.8),
-        (0, 0.2),  # PIPE_discount
-        (0, 0.5),  # PIPE_warrant_coverage
-        (0, 0.05)  # ATM_issuance_cost
+def _ensure_2d(arr):
+    """Ensures pymoo outputs are treated as 2D arrays."""
+    arr = np.asarray(arr)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    return arr
+
+def _select_pareto_candidates(res, params):
+    """
+    Given a pymoo result, construct three representative candidates:
+    Defensive (min breach), Balanced (closest to 'utopia'), Growth (max BTC).
+    """
+    X = _ensure_2d(res.X)
+    F = _ensure_2d(res.F)
+    if X.size == 0 or F.size == 0:
+        return []
+    # Defensive: minimize breach probability (F[:,2])
+    def_idx = int(np.argmin(F[:, 2]))
+    # Growth: maximize BTC => minimize F[:,0] which is negative BTC
+    gro_idx = int(np.argmin(F[:, 0]))
+    # Balanced: closest to utopia point (component-wise min)
+    utopia = np.array([np.min(F[:, 0]), np.min(F[:, 1]), np.min(F[:, 2])], dtype=float)
+    distances = np.sqrt(np.sum((F - utopia) ** 2, axis=1))
+    bal_idx = int(np.argmin(distances))
+    # Build parameter dicts for each style
+    def _mk_params(i):
+        return {
+            'amount': float(X[i, 0]),
+            'rate': float(X[i, 1]),
+            'ltv_cap': float(X[i, 2]),
+            'hedge_intensity': float(X[i, 3]),
+            'premium': float(X[i, 4]),
+            'btc_bought': float(X[i, 0] / max(params['BTC_current_market_price'], 1e-9))
+        }
+    return [
+        ('Defensive', _mk_params(def_idx)),
+        ('Balanced', _mk_params(bal_idx)),
+        ('Growth', _mk_params(gro_idx)),
     ]
 
-    try:
-        result = minimize(objective, x0, bounds=bounds, method='L-BFGS-B',
-                         options={'maxiter': 20, 'ftol': 1e-6})
-
-        if result.success:
-            optimized_principal = max(0, result.x[0])
-            optimized_rate = max(params['risk_free_rate'], min(result.x[1], params['risk_free_rate'] + 0.15))
-            optimized_ltv = max(0.1, min(result.x[2], 0.8))
-            optimized_pipe_discount = max(0, min(result.x[3], 0.2))
-            optimized_pipe_warrant_coverage = max(0, min(result.x[4], 0.5))
-            optimized_atm_issuance_cost = max(0, min(result.x[5], 0.05))
-            btc_purchased = 0 if params['BTC_current_market_price'] == 0 else optimized_principal / params['BTC_current_market_price']
-
-            logger.info(f"Optimization successful: Principal=${optimized_principal:.2f}, Rate={optimized_rate:.4f}, LTV={optimized_ltv:.4f}, "
-                        f"PIPE_Discount={optimized_pipe_discount:.4f}, PIPE_Warrant_Coverage={optimized_pipe_warrant_coverage:.4f}, "
-                        f"ATM_Issuance_Cost={optimized_atm_issuance_cost:.4f}")
-
-            return {
-                'LoanPrincipal': optimized_principal,
-                'cost_of_debt': optimized_rate,
-                'LTV_Cap': optimized_ltv,
-                'BTC_purchased': btc_purchased,
-                'PIPE_discount': optimized_pipe_discount,
-                'PIPE_warrant_coverage': optimized_pipe_warrant_coverage,
-                'ATM_issuance_cost': optimized_atm_issuance_cost
-            }
-        else:
-            logger.warning(f"Optimization failed: {result.message}")
-            return None
-
-    except Exception as e:
-        logger.error(f"Optimization process error: {str(e)}")
+def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
+    """
+    Top-level optimizer:
+    - Runs NSGA-II per structure: ['ATM', 'PIPE', 'Convertible', 'Loan']
+    - Selects three representative points (Defensive/Balanced/Growth) per structure
+    - Scores all candidates cross-structure and returns the best three overall
+    Returns:
+        List[dict]: [
+            {'type': 'Defensive'|'Balanced'|'Growth', 'params': {...}},
+            {'type': ...}, {'type': ...}
+        ]
+    """
+    logger.info("NSGA-II optimizer starting")
+    structures = ['ATM', 'PIPE', 'Convertible', 'Loan']
+    all_candidates = []
+    for structure in structures:
+        try:
+            p = params.copy()
+            p['structure'] = structure
+            # Problem and algorithm (common random numbers via shared paths)
+            problem = TreasuryProblem(p, btc_prices, vol_heston)
+            algorithm = NSGA2(pop_size=50)
+            # Keep the termination style consistent with prior usage
+            res = pymoo_minimize(problem, algorithm, ('n_gen', 20), seed=42, verbose=False)
+            if res.X is None or res.F is None:
+                logger.debug(f"No solution produced for structure {structure}")
+                continue
+            reps = _select_pareto_candidates(res, p)
+            for cand_type, cand_params in reps:
+                all_candidates.append({
+                    'type': cand_type,
+                    'params': {
+                        'structure': structure,
+                        **cand_params
+                    }
+                })
+        except Exception as e:
+            logger.info(f"Optimization skipped for {structure}: {e}")
+    if not all_candidates:
+        logger.info("No candidates produced by optimizer")
         return None
+    # Cross-structure scoring using consistent paths (fair ranking)
+    scored = []
+    for cand in all_candidates:
+        m = evaluate_candidate(params, cand, btc_prices, vol_heston)
+        if params['objective_preset'] == 'defensive':
+            score = float(m['ltv_breach_prob'])
+        elif params['objective_preset'] == 'growth':
+            score = -float(m['btc_net_added'])
+        else:
+            # Balanced: weighted compromise
+            # Lower is better for score
+            score = (
+                0.30 * float(m['dilution_p50']) +
+                0.30 * float(m['ltv_breach_prob']) -
+                0.40 * float(m['btc_net_added'])
+            )
+        scored.append((score, cand, m))
+    # Sort by score, keep top 3 diverse picks (prefer distinct structures/types if possible)
+    scored.sort(key=lambda t: t[0])
+    top = []
+    seen_keys = set()
+    for _, cand, _metrics in scored:
+        key = (cand['type'], cand['params']['structure'])
+        if key in seen_keys:
+            continue
+        top.append(cand)
+        seen_keys.add(key)
+        if len(top) == 3:
+            break
+    # Fallback: ensure we return 3 if diversity filter removed too many
+    if len(top) < 3:
+        for _, cand, _ in scored:
+            if cand not in top:
+                top.append(cand)
+                if len(top) == 3:
+                    break
+    return top
