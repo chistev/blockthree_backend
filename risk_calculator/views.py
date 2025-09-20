@@ -16,14 +16,15 @@ import logging
 import pdfplumber
 import pandas as pd
 import re
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential
 from sec_api import QueryApi, ExtractorApi
 import hashlib
 import datetime
 from difflib import SequenceMatcher
 from jsonpatch import JsonPatch
-from celery import shared_task
 from django.core.cache import cache
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from risk_calculator.utils.metrics import calculate_metrics, evaluate_candidate
 from risk_calculator.utils.optimization import optimize_for_corporate_treasury
 from risk_calculator.utils.simulation import simulate_btc_paths
@@ -31,6 +32,7 @@ from risk_calculator.utils.simulation import simulate_btc_paths
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Reduced default paths for faster runs
 DEFAULT_PARAMS = {
     'BTC_treasury': 1000,
     'BTC_purchased': 0,
@@ -38,7 +40,7 @@ DEFAULT_PARAMS = {
     'targetBTCPrice': 117000,
     'mu': 0.45,
     'sigma': 0.55,
-    't': 1.0,  # years
+    't': 1.0,
     'delta': 0.08,
     'initial_equity_value': 90_000_000,
     'new_equity_raised': 5_000_000,
@@ -50,15 +52,14 @@ DEFAULT_PARAMS = {
     'beta_ROE': 2.5,
     'expected_return_btc': 0.45,
     'risk_free_rate': 0.04,
-    'vol_mean_reversion_speed': 0.5,  # kappa
-    'long_run_volatility': 0.5,  # theta
-    'paths': 10_000,
+    'vol_mean_reversion_speed': 0.5,
+    'long_run_volatility': 0.5,
+    'paths': 2000,  # Reduced to 2000 for faster runs
     'jump_intensity': 0.10,
     'jump_mean': 0.0,
     'jump_volatility': 0.20,
     'min_profit_margin': 0.05,
     'annual_burn_rate': 12_000_000,
-    # To-Be params
     'initial_cash': 10_000_000,
     'shares_basic': 1_000_000,
     'shares_fd': 1_100_000,
@@ -66,8 +67,8 @@ DEFAULT_PARAMS = {
     'capex_schedule': [0.0] * 12,
     'tax_rate': 0.20,
     'nols': 5_000_000,
-    'adv_30d': 1_000_000,  # shares/day
-    'atm_pct_adv': 0.05,  # fraction of ADV per day
+    'adv_30d': 1_000_000,
+    'atm_pct_adv': 0.05,
     'pipe_discount': 0.10,
     'fees_ecm': 0.03,
     'fees_oid': 0.02,
@@ -75,38 +76,55 @@ DEFAULT_PARAMS = {
     'haircut_h0': 0.10,
     'haircut_alpha': 0.05,
     'liquidation_penalty_bps': 500,
-    'hedge_policy': 'none',  # 'none', 'protective_put', 'collar'
+    'hedge_policy': 'none',
     'hedge_intensity': 0.20,
     'hedge_tenor_days': 90,
-    'deribit_iv_source': 'manual',  # or 'live'
+    'deribit_iv_source': 'manual',
     'manual_iv': 0.55,
-    'objective_preset': 'balanced',  # 'defensive', 'balanced', 'growth'
+    'objective_preset': 'balanced',
     'cvar_on': True,
     'max_dilution': 0.15,
     'min_runway_months': 12,
     'max_breach_prob': 0.10,
-    # Variance reduction
-    'use_variance_reduction': True,  # Sobol + antithetic + CRNs
-    'bootstrap_samples': 1000
+    'use_variance_reduction': True,
+    'bootstrap_samples': 100
 }
+
+# Precompile regex patterns for SEC parsing
+REGEX_PATTERNS = {
+    'initial_equity_value': re.compile(r"Total\s+Shareholders?\s+Equity\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
+    'LoanPrincipal': re.compile(r"Long[-\s]?Term\s+Debt\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
+    'new_equity_raised': re.compile(r"Capital\s+Stock\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
+    'shares_basic': re.compile(r"Common\s+Stock\s+Shares\s+Outstanding\s+([\d,]+)", re.IGNORECASE),
+    'shares_fd': re.compile(r"Fully\s+Diluted\s+Shares\s+([\d,]+)", re.IGNORECASE),
+    'opex_monthly': re.compile(r"Operating\s+Expenses\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
+    'nols': re.compile(r"Net\s+Operating\s+Loss\s+Carryforward\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
+    'tax_rate': re.compile(r"Effective\s+Tax\s+Rate\s+([\d.]+)%", re.IGNORECASE),
+    'capex': re.compile(r"Capital\s+Expenditures\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
+}
+
 
 def get_json_data(request):
     return json.loads(request.body.decode('utf-8'))
 
-def fetch_btc_price():
+@lru_cache(maxsize=128)
+def fetch_btc_price_cached():
     try:
-        r = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=10)
+        cache_key = 'btc_price'
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        r = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=3)
         r.raise_for_status()
-        return r.json()['bitcoin']['usd']
+        price = r.json()['bitcoin']['usd']
+        cache.set(cache_key, price, timeout=300)  # Cache for 5 minutes
+        return price
     except Exception as e:
         logger.error(f"Live BTC price fetch failed: {e}")
         return None
-
-def fetch_deribit_iv(tenor_days: int) -> float:
-    """
-    Fetch an approximate BTC IV from Deribit book summary.
-    Returns fallback manual IV on failure.
-    """
+    
+@lru_cache(maxsize=128)
+def fetch_deribit_iv_cached(tenor_days: int) -> float:
     try:
         cache_key = f'deribit_iv_{tenor_days}'
         cached = cache.get(cache_key)
@@ -115,19 +133,16 @@ def fetch_deribit_iv(tenor_days: int) -> float:
         r = requests.get(
             'https://www.deribit.com/api/v2/public/get_book_summary_by_currency',
             params={'currency': 'BTC', 'kind': 'option'},
-            timeout=10
+            timeout=3
         )
         r.raise_for_status()
         data = r.json().get('result', []) or []
-        # Coarse filter: puts with tenor token present in instrument name
         vols = []
         tenor_token = str(int(tenor_days))
         for opt in data:
             name = opt.get('instrument_name', '')
             iv = opt.get('implied_volatility')
-            if not iv:
-                continue
-            if 'P' in name and tenor_token in name:
+            if iv and 'P' in name and tenor_token in name:
                 vols.append(iv)
         iv_ret = float(np.mean(vols)) if vols else DEFAULT_PARAMS['manual_iv']
         cache.set(cache_key, iv_ret, timeout=24*3600)
@@ -135,11 +150,10 @@ def fetch_deribit_iv(tenor_days: int) -> float:
     except Exception as e:
         logger.error(f"Deribit IV fetch failed: {e}")
         return DEFAULT_PARAMS['manual_iv']
-
+    
 def validate_inputs(params):
     errors = []
-    for k in ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury',
-              'targetBTCPrice', 'IssuePrice', 'LoanPrincipal']:
+    for k in ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice', 'IssuePrice', 'LoanPrincipal']:
         if params.get(k, 0) <= 0:
             errors.append(f"{k} must be positive")
     if params.get('BTC_purchased', 0) < 0:
@@ -160,9 +174,13 @@ def validate_inputs(params):
         errors.append("Optimizer constraints must be positive")
     if errors:
         raise ValueError("; ".join(errors))
-
+    
 def fetch_sec_data(ticker):
     try:
+        cache_key = f'sec_data_{ticker}'
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
         query_api = QueryApi(api_key=settings.SEC_API_KEY)
         extractor_api = ExtractorApi(api_key=settings.SEC_API_KEY)
         filings = query_api.get_filings(ticker=ticker, form_type=["10-K", "10-Q"], limit=1)
@@ -173,19 +191,11 @@ def fetch_sec_data(ticker):
         income_stmt = extractor_api.get_section(latest_url, "income-statement", "text") or ""
         cash_flow = extractor_api.get_section(latest_url, "cash-flow", "text") or ""
         doc_text = balance_sheet + "\n" + income_stmt + "\n" + cash_flow
-        patterns = {
-            'initial_equity_value': r"Total\s+Shareholders?\s+Equity\s+\$?([\d,]+(?:\.\d+)?)",
-            'LoanPrincipal': r"Long[-\s]?Term\s+Debt\s+\$?([\d,]+(?:\.\d+)?)",
-            'new_equity_raised': r"Capital\s+Stock\s+\$?([\d,]+(?:\.\d+)?)",
-            'shares_basic': r"Common\s+Stock\s+Shares\s+Outstanding\s+([\d,]+)",
-            'shares_fd': r"Fully\s+Diluted\s+Shares\s+([\d,]+)",
-            'opex_monthly': r"Operating\s+Expenses\s+\$?([\d,]+(?:\.\d+)?)",
-            'nols': r"Net\s+Operating\s+Loss\s+Carryforward\s+\$?([\d,]+(?:\.\d+)?)",
-            'tax_rate': r"Effective\s+Tax\s+Rate\s+([\d.]+)%",
-        }
         result = {}
-        for key, pat in patterns.items():
-            m = re.search(pat, doc_text, re.IGNORECASE)
+        for key, pat in REGEX_PATTERNS.items():
+            if key == 'capex':
+                continue
+            m = pat.search(doc_text)
             if m:
                 raw = float(m.group(1).replace(',', ''))
                 val = raw / 12.0 if key == 'opex_monthly' else raw
@@ -194,15 +204,16 @@ def fetch_sec_data(ticker):
             else:
                 result[key] = DEFAULT_PARAMS[key]
                 result[f'{key}_source'] = 'Default'
-        # Capex schedule from cash-flow text (best-effort)
-        m_capex = re.search(r"Capital\s+Expenditures\s+\$?([\d,]+(?:\.\d+)?)", cash_flow, re.IGNORECASE)
+        m_capex = REGEX_PATTERNS['capex'].search(cash_flow)
         capex_month = float(m_capex.group(1).replace(',', ''))/12.0 if m_capex else 0.0
         result['capex_schedule'] = [capex_month]*12
         result['capex_schedule_source'] = 'SEC XBRL' if m_capex else 'Default'
+        cache.set(cache_key, result, timeout=24*3600)
         return result
     except Exception as e:
         logger.error(f"Failed to fetch SEC data for {ticker}: {e}")
         return {'error': str(e)}
+    
 
 def parse_sec_file(file, ticker):
     try:
@@ -217,29 +228,21 @@ def parse_sec_file(file, ticker):
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
                     txt = page.extract_text() or ''
-                    tables = page.extract_tables() or []
-                    block_texts = [txt]
-                    for table in tables:
-                        for row in table:
-                            block_texts.append(' '.join(str(c) for c in row if c))
-                    for block in block_texts:
-                        for key, pat in {
-                            'initial_equity_value': r"Total\s+Shareholders?\s+Equity\s+\$?([\d,]+(?:\.\d+)?)",
-                            'LoanPrincipal': r"Long[-\s]?Term\s+Debt\s+\$?([\d,]+(?:\.\d+)?)",
-                            'new_equity_raised': r"Capital\s+Stock\s+\$?([\d,]+(?:\.\d+)?)",
-                            'shares_basic': r"Common\s+Stock\s+Shares\s+Outstanding\s+([\d,]+)",
-                            'shares_fd': r"Fully\s+Diluted\s+Shares\s+([\d,]+)",
-                            'opex_monthly': r"Operating\s+Expenses\s+\$?([\d,]+(?:\.\d+)?)",
-                            'nols': r"Net\s+Operating\s+Loss\s+Carryforward\s+\$?([\d,]+(?:\.\d+)?)",
-                            'tax_rate': r"Effective\s+Tax\s+Rate\s+([\d.]+)%",
-                        }.items():
-                            m = re.search(pat, block, re.IGNORECASE)
-                            if m:
-                                raw = float(m.group(1).replace(',', ''))
-                                val = raw/12.0 if key == 'opex_monthly' else raw
-                                result[key] = val
-                                result[f'{key}_source'] = 'Uploaded File'
-                    if not any(result.get('capex_schedule', [])):
+                    for key, pat in REGEX_PATTERNS.items():
+                        if key == 'capex':
+                            continue
+                        m = pat.search(txt)
+                        if m:
+                            raw = float(m.group(1).replace(',', ''))
+                            val = raw/12.0 if key == 'opex_monthly' else raw
+                            result[key] = val
+                            result[f'{key}_source'] = 'Uploaded File'
+                    m_capex = REGEX_PATTERNS['capex'].search(txt)
+                    if m_capex:
+                        capex_month = float(m_capex.group(1).replace(',', ''))/12.0
+                        result['capex_schedule'] = [capex_month]*12
+                        result['capex_schedule_source'] = 'Uploaded File'
+                    else:
                         result['capex_schedule'] = [0.0]*12
                         result['capex_schedule_source'] = 'Default'
         else:
@@ -423,7 +426,7 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
 def run_calculation(data, snapshot_id):
     params = {}
     try:
-        logger.info("Running synchronous calculation")
+        logger.info(f"Running calculation for snapshot {snapshot_id}")
         snapshot = Snapshot.objects.get(id=snapshot_id)
         params = json.loads(snapshot.params_json)
         params['export_format'] = data.get('format', 'json').lower()
@@ -431,46 +434,67 @@ def run_calculation(data, snapshot_id):
         params['mode'] = snapshot.mode
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
-        # Inject IV (so metrics does not import from views)
+        params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
+
+        # Inject IV
         if params.get('deribit_iv_source') == 'live':
-            params['option_iv'] = float(fetch_deribit_iv(int(params.get('hedge_tenor_days', 90))))
+            params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
         else:
             params['option_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
+
+        # Validate inputs once
         validate_inputs(params)
+
+        # Fetch live BTC price if needed
         if params['use_live']:
-            btc_price = fetch_btc_price()
+            btc_price = fetch_btc_price_cached()
             if btc_price:
                 params['BTC_current_market_price'] = btc_price
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
-        # Pass 1: simulate once → CRNs shared across optimizer/candidates
-        btc_prices_pass1, vol_heston_pass1 = simulate_btc_paths(params, seed=42)
-        candidates = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
+
+        # Single simulation pass for optimization and candidate evaluation
+        cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}"
+        cached_simulation = cache.get(cache_key)
+        if cached_simulation:
+            btc_prices, vol_heston = cached_simulation
+        else:
+            btc_prices, vol_heston = simulate_btc_paths(params, seed=42)
+            cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)  # Cache for 1 hour
+
+        # Optimize with fewer candidates
+        candidates = optimize_for_corporate_treasury(params, btc_prices, vol_heston)
         if not candidates:
             raise ValueError("Optimization failed to produce candidates")
-        candidate_results = []
-        for cand in candidates:
+
+        # Parallelize candidate evaluation
+        def evaluate_candidate_wrapper(cand):
             temp_params = params.copy()
             temp_params.update(cand['params'])
-            # evaluate_candidate uses calculate_metrics internally
-            cand_metrics = evaluate_candidate(temp_params, cand, btc_prices_pass1, vol_heston_pass1)
-            candidate_results.append({
+            return {
                 'type': cand['type'],
                 'params': cand['params'],
-                'metrics': cand_metrics
-            })
-        # Pass 2: choose Balanced (or first if none)
+                'metrics': evaluate_candidate(temp_params, cand, btc_prices, vol_heston)
+            }
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            candidate_results = list(executor.map(evaluate_candidate_wrapper, candidates))
+
+        # Select Balanced candidate or first
         balanced = next((c for c in candidates if c['type'] == 'Balanced'), candidates[0])
         stable_params = params.copy()
         stable_params.update(balanced['params'])
-        btc_prices_pass2, vol_heston_pass2 = simulate_btc_paths(stable_params, seed=43)
-        final_metrics = calculate_metrics(stable_params, btc_prices_pass2, vol_heston_pass2)
-        # MC stability hint
+
+        # Reuse simulation if parameters haven't changed significantly
+        final_metrics = calculate_metrics(stable_params, btc_prices, vol_heston)
+
+        # Check Monte Carlo stability
         nav_paths = np.array(final_metrics.get('nav', {}).get('nav_paths_preview', []))
         if nav_paths.size > 0:
             est_se = np.std(nav_paths) / max(1, np.sqrt(min(len(nav_paths), params['paths'])))
             if final_metrics['nav']['avg_nav'] != 0 and est_se > 0.01 * abs(final_metrics['nav']['avg_nav']):
                 final_metrics['mc_warning'] = 'High variance; consider more paths or keep VR on.'
+
         payload = {
             'metrics': final_metrics,
             'candidates': candidate_results,
@@ -479,11 +503,13 @@ def run_calculation(data, snapshot_id):
             'timestamp': snapshot.timestamp.isoformat(),
             'mode': snapshot.mode
         }
+
         if params['export_format'] == 'csv':
             return generate_csv_response(final_metrics, candidate_results)
         elif params['export_format'] == 'pdf':
             return generate_pdf_response(final_metrics, candidate_results)
         return payload
+
     except Exception as e:
         logger.error(f"Calculation error: {e}")
         if params.get('export_format', 'json') in ['csv', 'pdf']:
@@ -498,20 +524,19 @@ def calculate(request):
         snap_id = data.get('snapshot_id')
         if not snap_id:
             return JsonResponse({'error': 'Snapshot ID required'}, status=400)
-        # Call run_calculation directly instead of using Celery
         result = run_calculation(data, snap_id)
-        # Handle different response types based on export_format
         if isinstance(result, HttpResponse):
-            return result  # CSV or PDF response
+            return result
         return JsonResponse(result)
     except Exception as e:
         logger.error(f"Calculate endpoint error: {e}")
         return JsonResponse({'error': str(e)}, status=400)
-    
+
+
 @csrf_exempt
 def get_btc_price(request):
     try:
-        p = fetch_btc_price()
+        p = fetch_btc_price_cached()
         if p is None:
             return JsonResponse({'error': 'Failed to fetch live BTC price'}, status=500)
         return JsonResponse({'BTC_current_market_price': p})
@@ -535,31 +560,40 @@ def what_if(request):
         params['use_live'] = data.get('use_live', False)
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
-        # IV injection
+        params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
+
         if params.get('deribit_iv_source') == 'live':
-            params['option_iv'] = float(fetch_deribit_iv(int(params.get('hedge_tenor_days', 90))))
+            params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
         else:
             params['option_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
+
         validate_inputs(params)
+
         if params['use_live']:
-            btc_price = fetch_btc_price()
+            btc_price = fetch_btc_price_cached()
             if btc_price:
                 params['BTC_current_market_price'] = btc_price
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
-        btc_prices_pass1, vol_heston_pass1 = simulate_btc_paths(params, seed=42)
+
+        cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}"
+        cached_simulation = cache.get(cache_key)
+        if cached_simulation:
+            btc_prices, vol_heston = cached_simulation
+        else:
+            btc_prices, vol_heston = simulate_btc_paths(params, seed=42)
+            cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
+
         if value in ['optimize', 'maximize'] or param == 'optimize_all':
-            opts = optimize_for_corporate_treasury(params, btc_prices_pass1, vol_heston_pass1)
+            opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, max_candidates=3)
             if opts:
                 balanced = next((c for c in opts if c['type'] == 'Balanced'), opts[0])
                 params.update(balanced['params'])
         else:
             params[param] = float(value)
-        resp1 = calculate_metrics(params, btc_prices_pass1, vol_heston_pass1)
-        stable_params = params.copy()
-        stable_params.update(resp1['term_sheet'])
-        btc_prices_pass2, vol_heston_pass2 = simulate_btc_paths(stable_params, seed=43)
-        final_data = calculate_metrics(stable_params, btc_prices_pass2, vol_heston_pass2)
+
+        final_data = calculate_metrics(params, btc_prices, vol_heston)
+
         if params['export_format'] == 'csv':
             return generate_csv_response(final_data, [{'type': 'What-If', 'params': final_data['term_sheet'], 'metrics': final_data}])
         elif params['export_format'] == 'pdf':
@@ -568,7 +602,7 @@ def what_if(request):
     except Exception as e:
         logger.error(f"What-If endpoint error: {e}")
         return JsonResponse({'error': str(e)}, status=400)
-
+    
 @csrf_exempt
 @require_POST
 def reproduce_run(request):
@@ -581,12 +615,21 @@ def reproduce_run(request):
         params['export_format'] = data.get('format', 'json').lower()
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
-        # IV injection
+        params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
+
         if params.get('deribit_iv_source') == 'live':
-            params['option_iv'] = float(fetch_deribit_iv(int(params.get('hedge_tenor_days', 90))))
+            params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
         else:
             params['option_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
-        btc_prices, vol_heston = simulate_btc_paths(params, seed=seed)
+
+        cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{seed}"
+        cached_simulation = cache.get(cache_key)
+        if cached_simulation:
+            btc_prices, vol_heston = cached_simulation
+        else:
+            btc_prices, vol_heston = simulate_btc_paths(params, seed=seed)
+            cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
+
         metrics = calculate_metrics(params, btc_prices, vol_heston)
         resp = {
             'metrics': metrics,

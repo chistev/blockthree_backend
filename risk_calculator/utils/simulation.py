@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.stats import t, norm, qmc
+from scipy.stats import norm, qmc
 import logging
 from multiprocessing import Pool, cpu_count
 from functools import partial
@@ -19,19 +19,9 @@ def simulate_btc_paths_chunk(params, seed, start_idx, chunk_size):
         return btc_prices, vol_heston
 
     dt = float(params['t']) / T
-    # Drift: halving adjustment + jump compensator + weak targeting
+    # Simplified drift: combine halving adjustment and weak targeting
     mu_base = params['mu'] * 0.5  # post-2024 halving heuristic
-    mu_bayes = 0.5 * mu_base + 0.5 * 0.4
-    jump_comp = params['jump_intensity'] * (
-        np.exp(params['jump_mean'] + 0.5 * params['jump_volatility']**2) - 1.0
-    )
-    mu_adj = mu_bayes - jump_comp
-    start_val = max(1e-9, params['BTC_treasury'] * params['BTC_current_market_price'])
-    target_val = max(1e-9, params['BTC_treasury'] * params['targetBTCPrice'])
-    drift_to_target = (
-        np.log(target_val / start_val) / max(1e-9, float(params['t'])) - 0.5 * params['sigma']**2
-    )
-    mu_adj = 0.7 * mu_adj + 0.3 * drift_to_target
+    mu_adj = 0.7 * mu_base + 0.3 * (np.log(params['targetBTCPrice'] / params['BTC_current_market_price']) / max(1e-9, float(params['t'])))
 
     # Variance process parameters
     kappa = float(params['vol_mean_reversion_speed'])
@@ -40,46 +30,36 @@ def simulate_btc_paths_chunk(params, seed, start_idx, chunk_size):
     v0 = max(1e-4, theta)  # start variance ~ long-run vol
     eps = 1e-6
 
-    # Sobol-based normals and uniforms (VR + CRNs)
-    d = 3 * (T - 1) if T > 1 else 3
+    # Sobol sequence for variance reduction
+    d = 2 * (T - 1) if T > 1 else 2  # Reduced dimensions (removed jumps)
     m = qmc.Sobol(d=d, scramble=True, seed=seed + start_idx)
     half = (chunk_size + 1) // 2
     U = m.random(half)
     U_anti = 1.0 - U
     U_full = np.vstack([U, U_anti])[:chunk_size, :]
     Z = norm.ppf(np.clip(U_full, 1e-9, 1-1e-9))
-    Z_r = Z[:, 0:(T-1)]
-    Z_v = Z[:, (T-1):2*(T-1)]
-    U_j = U_full[:, 2*(T-1):3*(T-1)] if T > 1 else np.empty((chunk_size, 0))
+    Z_r = Z[:, 0:(T-1)] if T > 1 else np.empty((chunk_size, 0))
+    Z_v = Z[:, (T-1):2*(T-1)] if T > 1 else np.empty((chunk_size, 0))
 
-    # Jumps (fat tails)
-    J_sizes = t.rvs(
-        df=5,
-        loc=params['jump_mean'],
-        scale=params['jump_volatility'],
-        size=(chunk_size, max(0, T-1)),
-        random_state=seed + start_idx
-    )
-    J_flags = (U_j < params['jump_intensity'] * dt) if T > 1 else np.zeros((chunk_size, 0), dtype=bool)
-
-    # Simulate variance path
+    # Simulate variance path (simplified, no jumps)
     v = np.empty((chunk_size, max(1, T-1)))
     v[:, 0 if T > 1 else 0] = v0
-    for t_idx in range(1, T-1):
-        v_prev = v[:, t_idx-1]
-        v[:, t_idx] = np.maximum(
-            v_prev + kappa * (theta - v_prev) * dt +
-            xi * np.sqrt(np.maximum(v_prev, eps)) * np.sqrt(dt) * Z_v[:, t_idx-1],
-            1e-4
-        )
+    if T > 1:
+        sqrt_dt = np.sqrt(dt)
+        for t_idx in range(1, T-1):
+            v_prev = v[:, t_idx-1]
+            v[:, t_idx] = np.maximum(
+                v_prev + kappa * (theta - v_prev) * dt +
+                xi * np.sqrt(np.maximum(v_prev, eps)) * sqrt_dt * Z_v[:, t_idx-1],
+                1e-4
+            )
     vol_path = np.sqrt(v)
 
     # Simulate returns → prices
     prices = np.empty((chunk_size, T))
     prices[:, 0] = float(params['BTC_current_market_price'])
     if T > 1:
-        ret = (mu_adj * dt) + vol_path * np.sqrt(dt) * Z_r
-        ret += J_flags * J_sizes
+        ret = (mu_adj - 0.5 * v) * dt + vol_path * np.sqrt(dt) * Z_r
         logS = np.cumsum(ret, axis=1)
         prices[:, 1:] = prices[:, [0]] * np.exp(logS)
     else:
@@ -95,11 +75,12 @@ def simulate_btc_paths(params, seed=42):
     """
     N = int(params['paths'])
     T = int(max(1, round(12 * float(params['t']))))  # monthly steps
-    num_processes = min(cpu_count(), 8)  # Cap at 8 to avoid overhead
-    chunk_size = N // num_processes
-    if chunk_size == 0:
-        chunk_size = N
+    # Dynamic process allocation
+    num_processes = min(cpu_count(), max(1, N // 1000))  # Fewer processes for small N
+    chunk_size = max(1, N // num_processes)
+    if chunk_size < 100:
         num_processes = 1
+        chunk_size = N
 
     logger.info(f"Using {num_processes} processes for {N} paths, chunk size {chunk_size}")
 
@@ -110,8 +91,11 @@ def simulate_btc_paths(params, seed=42):
         args[-1] = (params, seed, (num_processes-1) * chunk_size, N - (num_processes-1) * chunk_size)
 
     # Run parallel simulations
-    with Pool(processes=num_processes) as pool:
-        results = pool.starmap(simulate_btc_paths_chunk, args)
+    if num_processes > 1:
+        with Pool(processes=num_processes) as pool:
+            results = pool.starmap(simulate_btc_paths_chunk, args)
+    else:
+        results = [simulate_btc_paths_chunk(*args[0])]
 
     # Combine results
     prices = np.vstack([res[0] for res in results])

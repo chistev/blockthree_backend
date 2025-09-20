@@ -160,9 +160,9 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
             p['structure'] = structure
             # Problem and algorithm (common random numbers via shared paths)
             problem = TreasuryProblem(p, btc_prices, vol_heston)
-            algorithm = NSGA2(pop_size=50)
+            algorithm = NSGA2(pop_size=25)
             # Keep the termination style consistent with prior usage
-            res = pymoo_minimize(problem, algorithm, ('n_gen', 20), seed=42, verbose=False)
+            res = pymoo_minimize(problem, algorithm, ('n_gen', 10), seed=42, verbose=False)
             if res.X is None or res.F is None:
                 logger.debug(f"No solution produced for structure {structure}")
                 continue
