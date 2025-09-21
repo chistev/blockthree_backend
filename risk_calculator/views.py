@@ -2,6 +2,7 @@ from django.conf import settings
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST, require_GET
 from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
 from .models import Snapshot
 import numpy as np
 import requests
@@ -373,20 +374,41 @@ def lock_snapshot(request):
         mode = data.get('mode', 'pro-forma')
         if mode not in ['public', 'private', 'pro-forma']:
             return JsonResponse({'error': 'Invalid mode'}, status=400)
+        
+        # Generate hash for the snapshot
         hash_val = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
-        ts = datetime.datetime.now()
-        snap = Snapshot.objects.create(
-            hash=hash_val,
-            timestamp=ts,
-            params_json=json.dumps(params),
-            mode=mode,
-            user=request.user.username if getattr(request, 'user', None) and request.user.is_authenticated else 'anonymous'
-        )
-        return JsonResponse({'snapshot_id': snap.id, 'hash': hash_val, 'timestamp': ts.isoformat(), 'mode': mode})
+        
+        # Check if a snapshot with this hash already exists
+        try:
+            snap = Snapshot.objects.get(hash=hash_val)
+            logger.info(f"Reusing existing snapshot with ID {snap.id} for hash {hash_val}")
+            return JsonResponse({
+                'snapshot_id': snap.id,
+                'hash': hash_val,
+                'timestamp': snap.timestamp.isoformat(),
+                'mode': snap.mode
+            })
+        except Snapshot.DoesNotExist:
+            # Create new snapshot if no existing one is found
+            ts = timezone.now()  # Use timezone-aware datetime
+            snap = Snapshot.objects.create(
+                hash=hash_val,
+                timestamp=ts,
+                params_json=json.dumps(params),
+                mode=mode,
+                user=request.user.username if getattr(request, 'user', None) and request.user.is_authenticated else 'anonymous'
+            )
+            logger.info(f"Created new snapshot with ID {snap.id} for hash {hash_val}")
+            return JsonResponse({
+                'snapshot_id': snap.id,
+                'hash': hash_val,
+                'timestamp': ts.isoformat(),
+                'mode': mode
+            })
     except Exception as e:
         logger.error(f"Lock snapshot error: {e}")
         return JsonResponse({'error': str(e)}, status=400)
-
+    
 def generate_csv_response(metrics, candidates):
     output = StringIO()
     writer = csv.writer(output)
