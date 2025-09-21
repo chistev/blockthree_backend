@@ -16,7 +16,7 @@ import logging
 import pdfplumber
 import pandas as pd
 import re
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from sec_api import QueryApi, ExtractorApi
 import hashlib
 import datetime
@@ -176,44 +176,62 @@ def validate_inputs(params):
         raise ValueError("; ".join(errors))
     
 def fetch_sec_data(ticker):
+    """
+    Fetch financial data for a given ticker using Alpha Vantage API.
+    """
     try:
-        cache_key = f'sec_data_{ticker}'
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-        query_api = QueryApi(api_key=settings.SEC_API_KEY)
-        extractor_api = ExtractorApi(api_key=settings.SEC_API_KEY)
-        filings = query_api.get_filings(ticker=ticker, form_type=["10-K", "10-Q"], limit=1)
-        if not filings.get('filings'):
-            raise ValueError(f"No recent filings for {ticker}")
-        latest_url = filings['filings'][0]['linkToFilingDetails']
-        balance_sheet = extractor_api.get_section(latest_url, "balance-sheet", "text") or ""
-        income_stmt = extractor_api.get_section(latest_url, "income-statement", "text") or ""
-        cash_flow = extractor_api.get_section(latest_url, "cash-flow", "text") or ""
-        doc_text = balance_sheet + "\n" + income_stmt + "\n" + cash_flow
-        result = {}
-        for key, pat in REGEX_PATTERNS.items():
-            if key == 'capex':
-                continue
-            m = pat.search(doc_text)
-            if m:
-                raw = float(m.group(1).replace(',', ''))
-                val = raw / 12.0 if key == 'opex_monthly' else raw
-                result[key] = val
-                result[f'{key}_source'] = 'SEC XBRL'
-            else:
-                result[key] = DEFAULT_PARAMS[key]
-                result[f'{key}_source'] = 'Default'
-        m_capex = REGEX_PATTERNS['capex'].search(cash_flow)
-        capex_month = float(m_capex.group(1).replace(',', ''))/12.0 if m_capex else 0.0
-        result['capex_schedule'] = [capex_month]*12
-        result['capex_schedule_source'] = 'SEC XBRL' if m_capex else 'Default'
-        cache.set(cache_key, result, timeout=24*3600)
+        api_key = settings.ALPHA_VANTAGE_API_KEY
+        if not api_key:
+            raise ValueError("Alpha Vantage API key is invalid or missing. Check your .env file.")
+
+        @retry(
+            stop=stop_after_attempt(3),  # Retry up to 3 times
+            wait=wait_exponential(multiplier=1, min=4, max=10),  # 4s, 8s, 10s
+            retry=retry_if_exception_type(requests.exceptions.RequestException),
+            before_sleep=lambda retry_state: logger.warning(
+                f"Retrying Alpha Vantage API call (attempt {retry_state.attempt_number})..."
+            )
+        )
+        def make_api_call():
+            url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={ticker}&apikey={api_key}"
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            return response.json()
+
+        data = make_api_call()
+
+        # Handle rate limit or missing data
+        if 'annualReports' not in data:
+            if 'Information' in data and 'API rate limit' in data['Information']:
+                raise ValueError("Alpha Vantage API rate limit exceeded. Please try again later.")
+            raise ValueError(f"No balance sheet data found for ticker {ticker}")
+
+        # Get latest annual report
+        latest_report = data['annualReports'][0]
+
+        def safe_float(value, default=0.0):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        total_equity = safe_float(latest_report.get('totalShareholderEquity'))
+        total_debt = safe_float(latest_report.get('longTermDebt'))
+        # Not exact, but closest available from balance sheet
+        new_equity_raised = safe_float(latest_report.get('capitalStock'))  
+
+        result = {
+            'initial_equity_value': total_equity if total_equity > 0 else DEFAULT_PARAMS['initial_equity_value'],
+            'LoanPrincipal': total_debt if total_debt > 0 else DEFAULT_PARAMS['LoanPrincipal'],
+            'new_equity_raised': new_equity_raised if new_equity_raised > 0 else DEFAULT_PARAMS['new_equity_raised'],
+        }
+
+        logger.info(f"Fetched Alpha Vantage data for {ticker}: {result}")
         return result
+
     except Exception as e:
-        logger.error(f"Failed to fetch SEC data for {ticker}: {e}")
+        logger.error(f"Failed to fetch Alpha Vantage data for {ticker}: {str(e)}")
         return {'error': str(e)}
-    
 
 def parse_sec_file(file, ticker):
     try:
