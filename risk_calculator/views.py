@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.http import JsonResponse, HttpResponse
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_POST, require_GET
 from django.views.decorators.csrf import csrf_exempt
 from .models import Snapshot
 import numpy as np
@@ -90,6 +90,27 @@ DEFAULT_PARAMS = {
     'bootstrap_samples': 100
 }
 
+PRESET_MAPPINGS = {
+    'Defensive': {
+        'LTV_Cap': 0.5,
+        'min_profit_margin': 0.2,
+        'mu': 0.3,
+        'sigma': 0.4
+    },
+    'Balanced': {
+        'LTV_Cap': 0.7,
+        'min_profit_margin': 0.1,
+        'mu': 0.45,
+        'sigma': 0.6
+    },
+    'Growth': {
+        'LTV_Cap': 0.9,
+        'min_profit_margin': 0.05,
+        'mu': 0.6,
+        'sigma': 0.8
+    }
+}
+
 # Precompile regex patterns for SEC parsing
 REGEX_PATTERNS = {
     'initial_equity_value': re.compile(r"Total\s+Shareholders?\s+Equity\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
@@ -103,6 +124,13 @@ REGEX_PATTERNS = {
     'capex': re.compile(r"Capital\s+Expenditures\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
 }
 
+@require_GET
+def get_presets(request):
+    """
+    API endpoint to retrieve preset mappings.
+    Returns a JSON object containing the preset configurations.
+    """
+    return JsonResponse(PRESET_MAPPINGS, status=200)
 
 def get_json_data(request):
     return json.loads(request.body.decode('utf-8'))
