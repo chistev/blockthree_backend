@@ -299,6 +299,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     # Terminal metrics
     nav_T = nav[:, -1]
     avg_nav = float(np.mean(nav_T))
+    logger.info(f"Terminal NAV: avg_nav={avg_nav:.2f}, min_nav={np.min(nav_T):.2f}, max_nav={np.max(nav_T):.2f}")
     ci_nav = float(1.96 * np.std(nav_T, ddof=1) / np.sqrt(max(N, 1)))
     erosion_prob = float(np.mean(nav_T < 0.9 * avg_nav)) if avg_nav != 0 else 0.0
     # CVaR(95) on NAV if enabled
