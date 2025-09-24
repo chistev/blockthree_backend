@@ -106,37 +106,57 @@ def _ensure_2d(arr):
         return arr.reshape(1, -1)
     return arr
 
+def _mk_params(X_row, params):
+    """Helper function to create parameter dictionary from optimization result row."""
+    return {
+        'amount': float(X_row[0]),
+        'rate': float(X_row[1]),
+        'ltv_cap': float(X_row[2]),
+        'hedge_intensity': float(X_row[3]),
+        'premium': float(X_row[4]),
+        'btc_bought': float(X_row[0] / max(params['BTC_current_market_price'], 1e-9))
+    }
+
 def _select_pareto_candidates(res, params):
-    """
-    Given a pymoo result, construct three representative candidates:
-    Defensive (min breach), Balanced (closest to 'utopia'), Growth (max BTC).
-    """
+    """Ensure truly distinct candidates."""
     X = _ensure_2d(res.X)
     F = _ensure_2d(res.F)
+    
     if X.size == 0 or F.size == 0:
         return []
-    # Defensive: minimize breach probability (F[:,2])
-    def_idx = int(np.argmin(F[:, 2]))
-    # Growth: maximize BTC => minimize F[:,0] which is negative BTC
-    gro_idx = int(np.argmin(F[:, 0]))
-    # Balanced: closest to utopia point (component-wise min)
-    utopia = np.array([np.min(F[:, 0]), np.min(F[:, 1]), np.min(F[:, 2])], dtype=float)
-    distances = np.sqrt(np.sum((F - utopia) ** 2, axis=1))
-    bal_idx = int(np.argmin(distances))
-    # Build parameter dicts for each style
-    def _mk_params(i):
-        return {
-            'amount': float(X[i, 0]),
-            'rate': float(X[i, 1]),
-            'ltv_cap': float(X[i, 2]),
-            'hedge_intensity': float(X[i, 3]),
-            'premium': float(X[i, 4]),
-            'btc_bought': float(X[i, 0] / max(params['BTC_current_market_price'], 1e-9))
-        }
+    
+    # Filter for unique solutions (avoid numerical duplicates)
+    unique_solutions = []
+    seen_params = set()
+    
+    for i in range(len(X)):
+        param_tuple = tuple(round(float(x), 4) for x in X[i])  # Round to avoid floating-point duplicates
+        if param_tuple not in seen_params:
+            unique_solutions.append(i)
+            seen_params.add(param_tuple)
+    
+    if len(unique_solutions) < 3:
+        # If we don't have 3 unique solutions, return what we have
+        return [('Candidate', _mk_params(X[i], params)) for i in unique_solutions]
+    
+    # If we have enough unique solutions, select diverse ones
+    # Defensive: min breach probability
+    def_idx = min(unique_solutions, key=lambda i: F[i, 2])
+    # Growth: max BTC
+    gro_idx = min(unique_solutions, key=lambda i: F[i, 0])
+    # Balanced: closest to utopia, excluding the other two
+    remaining = [i for i in unique_solutions if i not in [def_idx, gro_idx]]
+    if remaining:
+        utopia = np.array([np.min(F[:, 0]), np.min(F[:, 1]), np.min(F[:, 2])])
+        distances = np.sqrt(np.sum((F[remaining] - utopia) ** 2, axis=1))
+        bal_idx = remaining[np.argmin(distances)]
+    else:
+        bal_idx = def_idx  # fallback
+    
     return [
-        ('Defensive', _mk_params(def_idx)),
-        ('Balanced', _mk_params(bal_idx)),
-        ('Growth', _mk_params(gro_idx)),
+        ('Defensive', _mk_params(X[def_idx], params)),
+        ('Balanced', _mk_params(X[bal_idx], params)),
+        ('Growth', _mk_params(X[gro_idx], params)),
     ]
 
 def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
