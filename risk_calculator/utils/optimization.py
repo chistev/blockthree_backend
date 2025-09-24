@@ -205,23 +205,23 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
     for cand in all_candidates:
         m = evaluate_candidate(params, cand, btc_prices, vol_heston)
         if params['objective_preset'] == 'defensive':
-            score = float(m['ltv_breach_prob'])
+            score = float(m['ltv']['exceed_prob'])
         elif params['objective_preset'] == 'growth':
-            score = -float(m['btc_net_added'])
+            score = -float(m['btc_holdings']['purchased_btc'])
         else:
             # Balanced: weighted compromise
             # Lower is better for score
             score = (
-                0.30 * float(m['dilution_p50']) +
-                0.30 * float(m['ltv_breach_prob']) -
-                0.40 * float(m['btc_net_added'])
+                0.30 * float(np.median(m['dilution']['dilution_paths'])) +
+                0.30 * float(m['ltv']['exceed_prob']) -
+                0.40 * float(m['btc_holdings']['purchased_btc'])
             )
         scored.append((score, cand, m))
     # Sort by score, keep top 3 diverse picks (prefer distinct structures/types if possible)
     scored.sort(key=lambda t: t[0])
     top = []
     seen_keys = set()
-    for _, cand, _metrics in scored:
+    for _, cand, _ in scored:
         key = (cand['type'], cand['params']['structure'])
         if key in seen_keys:
             continue

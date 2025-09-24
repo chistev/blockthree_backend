@@ -3,6 +3,8 @@ import numpy as np
 from scipy.stats import norm, t
 from typing import Dict, Any
 
+from risk_calculator.config import DEFAULT_PARAMS
+
 try:
     # Optional cache (works if running inside Django; harmless if not available)
     from django.core.cache import cache
@@ -126,13 +128,18 @@ def _fetch_deribit_iv_cached(tenor_days: int, manual_iv: float) -> float:
 
 def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray) -> Dict[str, Any]:
     """
-    Wraps calculate_metrics and shapes a compact candidate evaluation record
-    used by the optimizer ranking and CSV/PDF exports.
+    Wraps calculate_metrics and shapes a complete metrics evaluation record
+    including term_sheet with profit_margin, roe_uplift, and savings for each candidate.
     """
     tmp = dict(params)
     ctype = candidate.get("type")
     cpar = candidate.get("params", {})
-    tmp.update(cpar)
+    # Map candidate parameters to expected keys
+    tmp['LoanPrincipal'] = cpar.get('amount', tmp.get('LoanPrincipal', DEFAULT_PARAMS['LoanPrincipal']))
+    tmp['cost_of_debt'] = cpar.get('rate', tmp.get('cost_of_debt', DEFAULT_PARAMS['cost_of_debt']))
+    tmp['LTV_Cap'] = cpar.get('ltv_cap', tmp.get('LTV_Cap', DEFAULT_PARAMS['LTV_Cap']))
+    tmp['hedge_intensity'] = cpar.get('hedge_intensity', tmp.get('hedge_intensity', 0.0))
+    tmp['premium'] = cpar.get('premium', tmp.get('premium', 0.3))
     # Map preset types back to structures if needed
     if ctype in ("Defensive", "Balanced", "Growth"):
         ctype = cpar.get("structure", ctype)
@@ -158,28 +165,14 @@ def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_pr
     ltv_cap = float(tmp["LTV_Cap"])
     over = ltv_term[ltv_term > ltv_cap]
     breach_depth = float(np.mean(over - ltv_cap)) if over.size else 0.0
+    m['breach_depth'] = breach_depth  # Add if needed elsewhere
     # CVaR: pass-through if enabled
     cvar_val = m["nav"].get("cvar")
-    return {
-        "nav_dist": {
-            "mean": float(m["nav"]["avg_nav"]),
-            "ci_lower": float(m["nav"]["ci_lower"]),
-            "ci_upper": float(m["nav"]["ci_upper"]),
-            "erosion_prob": float(m["nav"]["erosion_prob"]),
-        },
-        "ltv_breach_prob": float(m["ltv"]["exceed_prob"]),
-        "breach_depth": breach_depth,
-        "cure_success_rate": float(m.get("cure_success_rate", 1.0)),
-        "runway_dist": {
-            "mean": float(m["runway"]["dist_mean"]),
-            "p95": float(m["runway"]["p95"]),
-        },
-        "dilution_p50": float(np.median(m["dilution"]["dilution_paths"])),
-        "dilution_p95": float(np.percentile(m["dilution"]["dilution_paths"], 95)),
-        "btc_net_added": float(tmp.get("BTC_purchased", 0.0)),
-        "oas": float(tmp["cost_of_debt"] + (m.get("hedge_pnl_avg", 0.0) / tmp["LoanPrincipal"]) if tmp["LoanPrincipal"] > 0 else tmp["cost_of_debt"]),
-        "cvar": float(cvar_val) if cvar_val is not None else None,
-    }
+    m['cvar'] = float(cvar_val) if cvar_val is not None else None  # Add top-level if desired
+    # Add structure-specific to term_sheet
+    if ctype == "ATM":
+        m['term_sheet']['slippage'] = slippage
+    return m
 
 def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray) -> Dict[str, Any]:
     """
@@ -328,9 +321,10 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     if params.get("structure") == "Convertible":
         S_term = float(np.mean(btc_prices[:, -1]))
         vol_term = float(max(np.mean(vol_heston[:, -1]), 1e-6))
+        conversion_price = params["IssuePrice"] * (1 + params.get("premium", 0.0))
         conv_val = tsiveriotis_fernandes_convertible(
             S_term,
-            float(params["IssuePrice"]),
+            conversion_price,
             float(params["risk_free_rate"]),
             float(params.get("delta", 0.0)),
             vol_term,
@@ -339,8 +333,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             float(params["cost_of_debt"]),
             credit_spread=0.02
         )
-        conversion_ratio = float(params["LoanPrincipal"]) / float(params["IssuePrice"]) if params["IssuePrice"] > 0 else 0.0
-        # TSM proxy against fully diluted shares
+        conversion_ratio = params["LoanPrincipal"] / conversion_price if conversion_price > 0 else 0.0
         dil_paths = np.full(
             N,
             conversion_ratio / (float(params["shares_fd"]) + conversion_ratio) if (float(params["shares_fd"]) + conversion_ratio) > 0 else 0.0,
@@ -415,6 +408,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     }
     # Term sheet & business impact (kept keys for CSV/PDF expectations)
     profit_margin = float((cost_of_debt - rf) / cost_of_debt) if cost_of_debt > 0 else 0.0
+    logger.info(f"Calculating profit_margin: cost_of_debt={cost_of_debt}, rf={rf}, profit_margin={profit_margin}")
     avg_conv_value = 0.0  # optionally compute/return if needed for displays
     roe_uplift = float(avg_roe - exp_btc)
     # A proxy "savings" vs. base dilution (kept for Views CSV export compatibility)

@@ -3,6 +3,8 @@ from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST, require_GET
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
+
+from risk_calculator.config import DEFAULT_PARAMS
 from .models import Snapshot
 import numpy as np
 import requests
@@ -32,64 +34,6 @@ from risk_calculator.utils.simulation import simulate_btc_paths
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Reduced default paths for faster runs
-DEFAULT_PARAMS = {
-    'BTC_treasury': 1000,
-    'BTC_purchased': 0,
-    'BTC_current_market_price': 117000,
-    'targetBTCPrice': 117000,
-    'mu': 0.45,
-    'sigma': 0.55,
-    't': 1.0,
-    'delta': 0.08,
-    'initial_equity_value': 90_000_000,
-    'new_equity_raised': 5_000_000,
-    'IssuePrice': 117000,
-    'LoanPrincipal': 25_000_000,
-    'cost_of_debt': 0.06,
-    'dilution_vol_estimate': 0.55,
-    'LTV_Cap': 0.50,
-    'beta_ROE': 2.5,
-    'expected_return_btc': 0.45,
-    'risk_free_rate': 0.04,
-    'vol_mean_reversion_speed': 0.5,
-    'long_run_volatility': 0.5,
-    'paths': 2000,  # Reduced to 2000 for faster runs
-    'jump_intensity': 0.10,
-    'jump_mean': 0.0,
-    'jump_volatility': 0.20,
-    'min_profit_margin': 0.05,
-    'annual_burn_rate': 12_000_000,
-    'initial_cash': 10_000_000,
-    'shares_basic': 1_000_000,
-    'shares_fd': 1_100_000,
-    'opex_monthly': 1_000_000,
-    'capex_schedule': [0.0] * 12,
-    'tax_rate': 0.20,
-    'nols': 5_000_000,
-    'adv_30d': 1_000_000,
-    'atm_pct_adv': 0.05,
-    'pipe_discount': 0.10,
-    'fees_ecm': 0.03,
-    'fees_oid': 0.02,
-    'cure_period_days': 30,
-    'haircut_h0': 0.10,
-    'haircut_alpha': 0.05,
-    'liquidation_penalty_bps': 500,
-    'hedge_policy': 'none',
-    'hedge_intensity': 0.20,
-    'hedge_tenor_days': 90,
-    'deribit_iv_source': 'manual',
-    'manual_iv': 0.55,
-    'objective_preset': 'balanced',
-    'cvar_on': True,
-    'max_dilution': 0.15,
-    'min_runway_months': 12,
-    'max_breach_prob': 0.10,
-    'use_variance_reduction': True,
-    'bootstrap_samples': 100
-}
 
 PRESET_MAPPINGS = {
     'Defensive': {
@@ -555,6 +499,25 @@ def run_calculation(data, snapshot_id):
 
         # Reuse simulation if parameters haven't changed significantly
         final_metrics = calculate_metrics(stable_params, btc_prices, vol_heston)
+
+        logger.info("=== CALCULATION RESULTS DEBUG ===")
+        logger.info(f"Final metrics keys: {final_metrics.keys()}")
+        
+        if 'term_sheet' in final_metrics:
+            logger.info(f"Term sheet data: {final_metrics['term_sheet']}")
+            logger.info(f"Profit margin: {final_metrics['term_sheet'].get('profit_margin', 'NOT FOUND')}")
+            logger.info(f"ROE uplift: {final_metrics['term_sheet'].get('roe_uplift', 'NOT FOUND')}")
+            logger.info(f"Savings: {final_metrics['term_sheet'].get('savings', 'NOT FOUND')}")
+        
+        for i, candidate in enumerate(candidate_results):
+            logger.info(f"Candidate {i} ({candidate['type']}):")
+            if 'metrics' in candidate and 'term_sheet' in candidate['metrics']:
+                ts = candidate['metrics']['term_sheet']
+                logger.info(f"  - Profit margin: {ts.get('profit_margin', 'NOT FOUND')}")
+                logger.info(f"  - ROE uplift: {ts.get('roe_uplift', 'NOT FOUND')}")
+                logger.info(f"  - Savings: {ts.get('savings', 'NOT FOUND')}")
+        
+        logger.info("=== END DEBUG ===")
 
         # Check Monte Carlo stability
         nav_paths = np.array(final_metrics.get('nav', {}).get('nav_paths_preview', []))
