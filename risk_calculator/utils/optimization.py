@@ -81,16 +81,7 @@ class TreasuryProblem(ElementwiseProblem):
             g0 = avg_dilution - self.params['max_dilution']
             g1 = self.params['min_runway_months'] - runway_mean
             g2 = breach_prob - self.params['max_breach_prob']
-            # Profitability penalty (keeps solutions economically meaningful)
-            if profit_margin < self.params['min_profit_margin']:
-                # Push far away in objective space and mark constraints infeasible
-                penalty = 1e6 * (self.params['min_profit_margin'] - profit_margin + 1.0)
-                f0 = penalty
-                f1 = penalty
-                f2 = penalty
-                g0 = max(g0, 1.0)  # make infeasible
-                g1 = max(g1, 1.0)
-                g2 = max(g2, 1.0)
+            
             out['F'] = [f0, f1, f2]
             out['G'] = [g0, g1, g2]
         except Exception as e:

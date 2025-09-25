@@ -133,8 +133,8 @@ def validate_inputs(params):
         errors.append("BTC_purchased cannot be negative")
     if params.get('paths', 0) < 1:
         errors.append("paths must be at least 1")
-    if params.get('min_profit_margin', 0) <= 0:
-        errors.append("min_profit_margin must be positive")
+    # if params.get('min_profit_margin', 0) <= 0:
+    #     errors.append("min_profit_margin must be positive")
     if params.get('long_run_volatility', 0) == 0:
         errors.append("long_run_volatility cannot be zero")
     if params.get('shares_basic', 0) <= 0 or params.get('shares_fd', 0) < params.get('shares_basic', 0):

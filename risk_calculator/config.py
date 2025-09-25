@@ -23,7 +23,7 @@ DEFAULT_PARAMS = {
     'jump_intensity': 0.10,
     'jump_mean': 0.0,
     'jump_volatility': 0.20,
-    'min_profit_margin': 0.05,
+    'min_profit_margin': 0.0,
     'annual_burn_rate': 12_000_000,
     'initial_cash': 10_000_000,
     'shares_basic': 1_000_000,
