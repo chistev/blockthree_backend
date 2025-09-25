@@ -1,2 +1,10 @@
-Total Shareholder Equity,Long-Term Debt,Capital Stock,Common Stock Shares Outstanding,Fully Diluted Shares,Operating Expenses,Net Operating Loss,Tax Rate
-90000000,15000000,5000000,12000000,13000000,2400000,2000000,0.25
+Metric,Value
+Total Shareholder Equity,100000000
+Long-Term Debt,30000000
+Capital Stock,5000000
+Common Stock Shares Outstanding,1000000
+Fully Diluted Shares,1100000
+Operating Expenses,12000000
+Net Operating Loss,5000000
+Effective Tax Rate,0.25
+Capital Expenditures,6000000

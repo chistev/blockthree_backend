@@ -215,6 +215,7 @@ def parse_sec_file(file, ticker):
         ext = file.name.split('.')[-1].lower()
         if ext not in ['pdf', 'xlsx', 'csv']:
             raise ValueError(f"Unsupported file format: {ext}")
+        
         if ext == 'pdf':
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
@@ -237,31 +238,87 @@ def parse_sec_file(file, ticker):
                         result['capex_schedule'] = [0.0]*12
                         result['capex_schedule_source'] = 'Default'
         else:
-            df = pd.read_excel(file) if ext == 'xlsx' else pd.read_csv(file)
-            target_cols = {
-                'initial_equity_value': ['Total Shareholder Equity', 'Shareholder Equity', 'Total Equity'],
-                'LoanPrincipal': ['Long-Term Debt', 'Total Debt', 'Debt'],
-                'new_equity_raised': ['Capital Stock', 'Common Stock'],
-                'shares_basic': ['Common Stock Shares Outstanding', 'Shares Outstanding'],
-                'shares_fd': ['Fully Diluted Shares', 'FD Shares'],
-                'opex_monthly': ['Operating Expenses', 'Opex'],
-                'nols': ['Net Operating Loss', 'NOL'],
-                'tax_rate': ['Tax Rate', 'Effective Tax Rate'],
-            }
-            for key, synonyms in target_cols.items():
-                for col in df.columns:
-                    if any(SequenceMatcher(None, col.lower(), s.lower()).ratio() > 0.8 for s in synonyms):
-                        v = float(df[col].iloc[0])
-                        result[key] = v/12.0 if key == 'opex_monthly' else v
-                        result[f'{key}_source'] = 'Uploaded File'
-                        break
+            # Improved CSV/Excel parsing
+            if ext == 'xlsx':
+                df = pd.read_excel(file)
+            else:  # CSV
+                df = pd.read_csv(file)
+            
+            logger.info(f"File columns: {df.columns.tolist()}")
+            logger.info(f"File shape: {df.shape}")
+            logger.info(f"First few rows:\n{df.head()}")
+            
+            # Handle different CSV formats
+            if len(df.columns) == 2 and 'Metric' in df.columns and 'Value' in df.columns:
+                # Format: Metric,Value (like your test file)
+                metric_dict = dict(zip(df['Metric'], df['Value']))
+                logger.info(f"Extracted metrics: {metric_dict}")
+                
+                # Map metric names to parameter names
+                mapping = {
+                    'Total Shareholder Equity': 'initial_equity_value',
+                    'Long-Term Debt': 'LoanPrincipal', 
+                    'Capital Stock': 'new_equity_raised',
+                    'Common Stock Shares Outstanding': 'shares_basic',
+                    'Fully Diluted Shares': 'shares_fd',
+                    'Operating Expenses': 'opex_monthly',
+                    'Net Operating Loss': 'nols',
+                    'Effective Tax Rate': 'tax_rate',
+                    'Capital Expenditures': 'capex_schedule'
+                }
+                
+                for metric_name, param_name in mapping.items():
+                    if metric_name in metric_dict:
+                        value = metric_dict[metric_name]
+                        # Handle percentage values
+                        if 'Tax Rate' in metric_name and isinstance(value, str) and '%' in value:
+                            value = float(value.replace('%', '')) / 100.0
+                        elif isinstance(value, str):
+                            # Remove commas and convert to float
+                            value = float(value.replace(',', ''))
+                        
+                        # Special handling for monthly values
+                        if param_name == 'opex_monthly':
+                            # If annual expense, convert to monthly
+                            if value > 1000000:  # Likely annual if large
+                                value = value / 12.0
+                        
+                        result[param_name] = value
+                        result[f'{param_name}_source'] = 'Uploaded File'
+                        logger.info(f"Mapped {metric_name} -> {param_name} = {value}")
+            
+            else:
+                # Original logic for other formats
+                target_cols = {
+                    'initial_equity_value': ['Total Shareholder Equity', 'Shareholder Equity', 'Total Equity'],
+                    'LoanPrincipal': ['Long-Term Debt', 'Total Debt', 'Debt'],
+                    'new_equity_raised': ['Capital Stock', 'Common Stock'],
+                    'shares_basic': ['Common Stock Shares Outstanding', 'Shares Outstanding'],
+                    'shares_fd': ['Fully Diluted Shares', 'FD Shares'],
+                    'opex_monthly': ['Operating Expenses', 'Opex'],
+                    'nols': ['Net Operating Loss', 'NOL'],
+                    'tax_rate': ['Tax Rate', 'Effective Tax Rate'],
+                }
+                
+                for key, synonyms in target_cols.items():
+                    for col in df.columns:
+                        if any(SequenceMatcher(None, col.lower(), s.lower()).ratio() > 0.8 for s in synonyms):
+                            v = float(df[col].iloc[0])
+                            result[key] = v/12.0 if key == 'opex_monthly' else v
+                            result[f'{key}_source'] = 'Uploaded File'
+                            break
+            
             result['capex_schedule'] = [0.0]*12
             result['capex_schedule_source'] = 'Default'
+        
+        logger.info(f"Final parsed result: {result}")
         return result
+        
     except Exception as e:
         logger.error(f"Failed to parse SEC file: {e}")
+        logger.error(f"Error details: {str(e)}", exc_info=True)
         return {'error': f"Failed to parse {ext.upper()} file: {e}"}
-
+    
 @csrf_exempt
 def get_default_params(request):
     try:
