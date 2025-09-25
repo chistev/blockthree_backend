@@ -23,6 +23,14 @@ def simulate_btc_paths_chunk(params, seed, start_idx, chunk_size):
     mu_base = params['mu'] * 0.5  # post-2024 halving heuristic
     mu_adj = 0.7 * mu_base + 0.3 * (np.log(params['targetBTCPrice'] / params['BTC_current_market_price']) / max(1e-9, float(params['t'])))
 
+    # Jump parameters (reintroduced)
+    jump_intensity = float(params['jump_intensity'])
+    jump_mean = float(params['jump_mean'])
+    jump_vol = float(params['jump_volatility'])
+    # Compensate drift for expected jump contribution (Merton-style)
+    compensate_drift = jump_intensity * (np.exp(jump_mean + 0.5 * jump_vol**2) - 1)
+    mu_gbm = mu_adj - compensate_drift
+
     # Variance process parameters
     kappa = float(params['vol_mean_reversion_speed'])
     theta = float(params['long_run_volatility'])
@@ -30,18 +38,24 @@ def simulate_btc_paths_chunk(params, seed, start_idx, chunk_size):
     v0 = max(1e-4, theta)  # start variance ~ long-run vol
     eps = 1e-6
 
-    # Sobol sequence for variance reduction
-    d = 2 * (T - 1) if T > 1 else 2  # Reduced dimensions (removed jumps)
+    # Sobol sequence for variance reduction (expanded dimensions for jumps)
+    d = 4 * (T - 1) if T > 1 else 4  # 2 for diffusion (Z_r, Z_v) + 2 for jumps (U_jump, Z_jump)
     m = qmc.Sobol(d=d, scramble=True, seed=seed + start_idx)
     half = (chunk_size + 1) // 2
     U = m.random(half)
     U_anti = 1.0 - U
     U_full = np.vstack([U, U_anti])[:chunk_size, :]
-    Z = norm.ppf(np.clip(U_full, 1e-9, 1-1e-9))
-    Z_r = Z[:, 0:(T-1)] if T > 1 else np.empty((chunk_size, 0))
-    Z_v = Z[:, (T-1):2*(T-1)] if T > 1 else np.empty((chunk_size, 0))
+    
+    # Normals for diffusion
+    Z_diff = norm.ppf(np.clip(U_full[:, :2*(T-1)], 1e-9, 1-1e-9)) if T > 1 else np.empty((chunk_size, 0))
+    Z_r = Z_diff[:, 0:(T-1)] if T > 1 else np.empty((chunk_size, 0))
+    Z_v = Z_diff[:, (T-1):2*(T-1)] if T > 1 else np.empty((chunk_size, 0))
+    
+    # Uniforms and normals for jumps (approximate Poisson as Bernoulli for QMC compatibility)
+    U_jump = U_full[:, 2*(T-1):3*(T-1)] if T > 1 else np.empty((chunk_size, 0))
+    Z_jump = norm.ppf(np.clip(U_full[:, 3*(T-1):], 1e-9, 1-1e-9)) if T > 1 else np.empty((chunk_size, 0))
 
-    # Simulate variance path (simplified, no jumps)
+    # Simulate variance path (simplified, no jumps in vol)
     v = np.empty((chunk_size, max(1, T-1)))
     v[:, 0 if T > 1 else 0] = v0
     if T > 1:
@@ -55,11 +69,19 @@ def simulate_btc_paths_chunk(params, seed, start_idx, chunk_size):
             )
     vol_path = np.sqrt(v)
 
-    # Simulate returns → prices
+    # Simulate returns → prices (with jump term added)
     prices = np.empty((chunk_size, T))
     prices[:, 0] = float(params['BTC_current_market_price'])
     if T > 1:
-        ret = (mu_adj - 0.5 * v) * dt + vol_path * np.sqrt(dt) * Z_r
+        # Diffusion component
+        diff_ret = (mu_gbm - 0.5 * v) * dt + vol_path * np.sqrt(dt) * Z_r
+        # Jump component (at most one per step; size added to log return if occurs)
+        jump_prob = jump_intensity * dt
+        jump_indicator = (U_jump < jump_prob)
+        jump_size = jump_mean + jump_vol * Z_jump
+        jump_ret = jump_indicator * jump_size
+        # Total return
+        ret = diff_ret + jump_ret
         logS = np.cumsum(ret, axis=1)
         prices[:, 1:] = prices[:, [0]] * np.exp(logS)
     else:
