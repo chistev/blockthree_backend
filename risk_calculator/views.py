@@ -357,37 +357,38 @@ def generate_csv_response(metrics, candidates):
     output = StringIO()
     writer = csv.writer(output)
     headers = [
-        'Candidate', 'NAV Mean', 'NAV Erosion Prob', 'Dilution P50', 'Dilution P95', 'LTV Breach Prob',
-        'Runway Months Mean', 'BTC Net Added', 'OAS', 'Structure', 'Amount', 'Rate', 'BTC Bought',
-        'Total BTC Treasury', 'Profit Margin', 'Savings', 'ROE Uplift',
-        'Bull NAV Impact', 'Base NAV Impact', 'Bear NAV Impact', 'Stress NAV Impact'
+        'Candidate', 'NAV Mean', 'NAV Erosion Prob', 'Dilution Avg', 'LTV Breach Prob',
+        'Runway Months Mean', 'BTC Total', 'Structure', 'Amount', 'Rate', 'BTC Bought',
+        'Savings', 'ROE Uplift', 'Profit Margin'
     ]
     writer.writerow(headers)
+    
     for c in candidates:
         m = c['metrics']
+        nav_data = m.get('nav', {})
+        dilution_data = m.get('dilution', {})
+        ltv_data = m.get('ltv', {})
+        runway_data = m.get('runway', {})
+        btc_data = m.get('btc_holdings', {})
+        term_sheet = m.get('term_sheet', {})
+        
         writer.writerow([
             c['type'],
-            f"{m['nav_dist']['mean']:.2f}",
-            f"{m['nav_dist']['erosion_prob']:.4f}",
-            f"{m['dilution_p50']:.4f}",
-            f"{m['dilution_p95']:.4f}",
-            f"{m['ltv_breach_prob']:.4f}",
-            f"{m['runway_dist']['mean']:.2f}",
-            f"{m['btc_net_added']:.2f}",
-            f"{m['oas']:.4f}",
-            c['params']['structure'],
-            f"{c['params']['amount']:.2f}",
-            f"{c['params']['rate']:.4f}",
-            f"{c['params']['btc_bought']:.2f}",
-            f"{metrics['btc_holdings']['total_btc']:.2f}",
-            f"{metrics['term_sheet']['profit_margin']:.4f}",
-            f"{metrics['business_impact']['savings']:.2f}",
-            f"{metrics['business_impact']['roe_uplift']:.2f}%",
-            f"{metrics['scenario_metrics']['Bull Case']['nav_impact']:.2f}%",
-            f"{metrics['scenario_metrics']['Base Case']['nav_impact']:.2f}%",
-            f"{metrics['scenario_metrics']['Bear Case']['nav_impact']:.2f}%",
-            f"{metrics['scenario_metrics']['Stress Test']['nav_impact']:.2f}%"
+            f"{nav_data.get('avg_nav', 0):.2f}",
+            f"{nav_data.get('erosion_prob', 0):.4f}",
+            f"{dilution_data.get('avg_dilution', 0):.4f}",
+            f"{ltv_data.get('exceed_prob', 0):.4f}",
+            f"{runway_data.get('dist_mean', 0):.2f}",
+            f"{btc_data.get('total_btc', 0):.2f}",
+            term_sheet.get('structure', 'N/A'),
+            f"{term_sheet.get('amount', 0):.2f}",
+            f"{term_sheet.get('rate', 0):.4f}",
+            f"{term_sheet.get('btc_bought', 0):.2f}",
+            f"{term_sheet.get('savings', 0):.2f}",
+            f"{term_sheet.get('roe_uplift', 0):.2f}%",
+            f"{term_sheet.get('profit_margin', 0):.4f}",
         ])
+    
     resp = HttpResponse(content_type='text/csv')
     resp['Content-Disposition'] = 'attachment; filename="metrics.csv"'
     resp.write(output.getvalue().encode('utf-8'))
@@ -401,23 +402,33 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
     elements = []
     elements.append(Paragraph(title, styles['Title']))
     elements.append(Spacer(1, 12))
+    
     for c in candidates:
         m = c['metrics']
+        # Use correct key structure from metrics.py
+        nav_data = m.get('nav', {})
+        dilution_data = m.get('dilution', {})
+        ltv_data = m.get('ltv', {})
+        runway_data = m.get('runway', {})
+        btc_data = m.get('btc_holdings', {})
+        term_sheet = m.get('term_sheet', {})
+        
         data = [
             ['Metric', 'Value'],
             ['Candidate', c['type']],
-            ['NAV Mean', f"${m['nav_dist']['mean']:.2f}"],
-            ['NAV Erosion Prob', f"{m['nav_dist']['erosion_prob']:.2%}"],
-            ['Dilution P50', f"{m['dilution_p50']:.2%}"],
-            ['Dilution P95', f"{m['dilution_p95']:.2%}"],
-            ['LTV Breach Prob', f"{m['ltv_breach_prob']:.2%}"],
-            ['Runway Months', f"{m['runway_dist']['mean']:.1f}"],
-            ['BTC Net Added', f"{m['btc_net_added']:.2f}"],
-            ['OAS', f"{m['oas']:.2%}"],
-            ['Structure', c['params']['structure']],
-            ['Amount', f"${c['params']['amount']:.2f}"],
-            ['Rate', f"{c['params']['rate']:.2%}"],
-            ['BTC Bought', f"{c['params']['btc_bought']:.2f}"],
+            ['NAV Mean', f"${nav_data.get('avg_nav', 0):.2f}"],
+            ['NAV Erosion Prob', f"{nav_data.get('erosion_prob', 0):.2%}"],
+            ['Dilution Avg', f"{dilution_data.get('avg_dilution', 0):.2%}"],
+            ['LTV Breach Prob', f"{ltv_data.get('exceed_prob', 0):.2%}"],
+            ['Runway Months', f"{runway_data.get('dist_mean', 0):.1f}"],
+            ['BTC Total', f"{btc_data.get('total_btc', 0):.2f}"],
+            ['Structure', term_sheet.get('structure', 'N/A')],
+            ['Amount', f"${term_sheet.get('amount', 0):.2f}"],
+            ['Rate', f"{term_sheet.get('rate', 0):.2%}"],
+            ['BTC Bought', f"{term_sheet.get('btc_bought', 0):.2f}"],
+            ['Savings', f"${term_sheet.get('savings', 0):.2f}"],
+            ['ROE Uplift', f"{term_sheet.get('roe_uplift', 0):.2f}%"],
+            ['Profit Margin', f"{term_sheet.get('profit_margin', 0):.2%}"],
         ]
         table = Table(data)
         table.setStyle(TableStyle([
@@ -427,6 +438,7 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
         ]))
         elements.append(table)
         elements.append(Spacer(1, 12))
+    
     doc.build(elements)
     pdf = buffer.getvalue()
     buffer.close()
