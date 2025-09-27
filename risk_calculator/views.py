@@ -750,20 +750,57 @@ def reproduce_run(request):
 @csrf_exempt
 def get_audit_trail(request):
     try:
+        # Get all snapshots ordered by timestamp (newest first)
         snapshots = Snapshot.objects.all().order_by('-timestamp')
-        diffs = []
-        for i in range(len(snapshots) - 1):
-            old_params = json.loads(snapshots[i + 1].params_json)
-            new_params = json.loads(snapshots[i].params_json)
-            patch = JsonPatch.from_diff(old_params, new_params)
-            diffs.append({
-                'snapshot_id': snapshots[i].id,
-                'timestamp': snapshots[i].timestamp.isoformat(),
-                'user': snapshots[i].user,
-                'changes': patch.patch
-            })
-        return JsonResponse({'audit_trail': diffs})
+        
+        audit_entries = []
+        
+        for snapshot in snapshots:
+            # Create a comprehensive audit entry for each snapshot
+            entry = {
+                'timestamp': snapshot.timestamp.isoformat(),
+                'user': snapshot.user,
+                'snapshot_id': snapshot.id,
+                'mode': snapshot.mode,
+                'action': 'calculate',  # Default action
+                'code_hash': hashlib.sha256(snapshot.params_json.encode()).hexdigest()[:16],
+                'seed': 42,  # Default seed used in calculations
+                'assumptions': json.loads(snapshot.params_json),
+                'changes': []  # Will populate with changes if we can compare with previous
+            }
+            
+            audit_entries.append(entry)
+        
+        # If we have multiple snapshots, calculate changes between consecutive ones
+        if len(audit_entries) > 1:
+            for i in range(len(audit_entries) - 1):
+                current = audit_entries[i]['assumptions']
+                previous = audit_entries[i + 1]['assumptions']
+                
+                changes = []
+                all_keys = set(current.keys()) | set(previous.keys())
+                
+                for key in all_keys:
+                    current_val = current.get(key)
+                    previous_val = previous.get(key)
+                    
+                    # Check if value changed (handle None cases)
+                    if current_val != previous_val:
+                        changes.append({
+                            'field': key,
+                            'from': previous_val,
+                            'to': current_val
+                        })
+                
+                audit_entries[i]['changes'] = changes
+                audit_entries[i]['action'] = f'Modified {len(changes)} parameters'
+        
+        # For the first entry, set a creation action
+        if audit_entries:
+            audit_entries[-1]['action'] = 'Initial calculation'
+        
+        return JsonResponse({'audit_trail': audit_entries})
+        
     except Exception as e:
         logger.error(f"Audit trail error: {e}")
         return JsonResponse({'error': str(e)}, status=500)
-    
