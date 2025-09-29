@@ -127,4 +127,3 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB limit
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB limit
 
 SEC_API_KEY = os.getenv('SEC_API_KEY')
-print(f"SEC_API_KEY: {os.getenv('SEC_API_KEY')}")
