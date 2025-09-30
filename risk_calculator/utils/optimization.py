@@ -29,10 +29,11 @@ class TreasuryProblem(ElementwiseProblem):
           btc_paths / vol paths provided in the constructor.
         - Applies a hard penalty if profit margin falls below min_profit_margin.
     """
-    def __init__(self, params, btc_prices, vol_heston):
+    def __init__(self, params, btc_prices, vol_heston, seed: int = 42):  # FIX: Added seed
         self.params = params
         self.btc_prices = btc_prices
         self.vol_heston = vol_heston
+        self.seed = seed  # FIX: Store seed
         xl = [
             0.0,
             params['risk_free_rate'],
@@ -67,7 +68,7 @@ class TreasuryProblem(ElementwiseProblem):
         price = max(p['BTC_current_market_price'], 1e-9)
         p['BTC_purchased'] = p['LoanPrincipal'] / price
         try:
-            m = calculate_metrics(p, self.btc_prices, self.vol_heston)
+            m = calculate_metrics(p, self.btc_prices, self.vol_heston, seed=self.seed)  # FIX: Pass seed
             total_btc = m['btc_holdings']['total_btc']
             avg_dilution = m['dilution']['avg_dilution']
             breach_prob = m['ltv']['exceed_prob']
@@ -150,7 +151,7 @@ def _select_pareto_candidates(res, params):
         ('Growth', _mk_params(X[gro_idx], params)),
     ]
 
-def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
+def optimize_for_corporate_treasury(params, btc_prices, vol_heston, max_candidates=3, seed: int = 42):  # FIX: Added seed and max_candidates (optional)
     """
     Top-level optimizer:
     - Runs NSGA-II per structure: ['ATM', 'PIPE', 'Convertible', 'Loan']
@@ -170,10 +171,10 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
             p = params.copy()
             p['structure'] = structure
             # Problem and algorithm (common random numbers via shared paths)
-            problem = TreasuryProblem(p, btc_prices, vol_heston)
+            problem = TreasuryProblem(p, btc_prices, vol_heston, seed=seed)  # FIX: Pass seed
             algorithm = NSGA2(pop_size=25)
             # Keep the termination style consistent with prior usage
-            res = pymoo_minimize(problem, algorithm, ('n_gen', 10), seed=42, verbose=False)
+            res = pymoo_minimize(problem, algorithm, ('n_gen', 10), seed=seed, verbose=False)  # FIX: Use seed here too for pymoo
             if res.X is None or res.F is None:
                 logger.debug(f"No solution produced for structure {structure}")
                 continue
@@ -194,7 +195,7 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston):
     # Cross-structure scoring using consistent paths (fair ranking)
     scored = []
     for cand in all_candidates:
-        m = evaluate_candidate(params, cand, btc_prices, vol_heston)
+        m = evaluate_candidate(params, cand, btc_prices, vol_heston, seed=seed)  # FIX: Pass seed
         if params['objective_preset'] == 'defensive':
             score = float(m['ltv']['exceed_prob'])
         elif params['objective_preset'] == 'growth':

@@ -1,14 +1,11 @@
 import logging
 import numpy as np
-from scipy.stats import norm, t
+from scipy.stats import norm
 from typing import Dict, Any
 
-from risk_calculator.config import DEFAULT_PARAMS
-
 try:
-    # Optional cache (works if running inside Django; harmless if not available)
     from django.core.cache import cache
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     cache = None
 
 logger = logging.getLogger(__name__)
@@ -22,7 +19,6 @@ def _bs_put_price(S, K, r, q, sigma, tau):
     sqrt_tau = np.sqrt(tau)
     d1 = (np.log(S / K) + (r - q + 0.5 * sigma * sigma) * tau) / (sigma * sqrt_tau)
     d2 = d1 - sigma * sqrt_tau
-    # Put = K e^{-rT} N(-d2) - S e^{-qT} N(-d1)
     return float(K * np.exp(-r * tau) * norm.cdf(-d2) - S * np.exp(-q * tau) * norm.cdf(-d1))
 
 def tsiveriotis_fernandes_convertible(
@@ -38,9 +34,7 @@ def tsiveriotis_fernandes_convertible(
     steps: int = 100
 ) -> float:
     """
-    VERY simplified Tsiveriotis–Fernandes-style split using a binomial lattice:
-    split into a credit-risky bond leg (discount r + spread) and an equity option leg (discount r).
-    This is an approximation intended for ranking scenarios, not trade booking.
+    Simplified Tsiveriotis–Fernandes-style split using a binomial lattice.
     """
     if T <= 0:
         return max(face, S - K)
@@ -51,28 +45,17 @@ def tsiveriotis_fernandes_convertible(
     disc_rs = np.exp(-(r + credit_spread) * dt)
     p = (np.exp((r - q) * dt) - d) / (u - d)
     p = np.clip(p, 0.0, 1.0)
-    # Trees
     bond = np.zeros((steps + 1, steps + 1))
     eqty = np.zeros((steps + 1, steps + 1))
-    # Coupon paid continuously approximated as rate * face * dt per step
     coupon = coupon_rate * face * dt
-    # Terminal conditions
     for j in range(steps + 1):
-        # Stock at node (steps, j)
         Sj = S * (u ** j) * (d ** (steps - j))
-        # Equity conversion value at expiry: max(S - K, 0)
         eqty[steps, j] = max(Sj - K, 0.0)
-        # Bond leg value at expiry: principal repayment
         bond[steps, j] = face
-    # Backward induction
     for i in range(steps - 1, -1, -1):
         for j in range(i + 1):
-            # Risky bond step (discount at r + spread)
             bond[i, j] = disc_rs * (p * bond[i + 1, j + 1] + (1 - p) * bond[i + 1, j]) + coupon
-            # Equity option step (discount at r)
             eqty[i, j] = disc_r * (p * eqty[i + 1, j + 1] + (1 - p) * eqty[i + 1, j])
-            # Basic early conversion proxy: allow taking equity value if it exceeds (face + acc coupon)
-            # (This is a crude early-conv proxy; for TF you'd solve PDE with equity component discounted at r)
             stock_here = S * (u ** j) * (d ** (i - j))
             conv_now = max(stock_here - K, 0.0)
             eqty[i, j] = max(eqty[i, j], conv_now)
@@ -81,8 +64,6 @@ def tsiveriotis_fernandes_convertible(
 def almgren_chriss_slippage(Q: float, ADV: float, H: float, eta: float = 0.10, lambda_param: float = 0.01, sigma: float = 0.55) -> float:
     """
     Minimal Almgren–Chriss style slippage estimate as fraction of price.
-    permanent impact ~ eta * Q / ADV
-    temporary impact ~ lambda * sigma * sqrt(H)
     """
     if ADV <= 0:
         return 0.0
@@ -92,11 +73,10 @@ def almgren_chriss_slippage(Q: float, ADV: float, H: float, eta: float = 0.10, l
 
 def _fetch_deribit_iv_cached(tenor_days: int, manual_iv: float) -> float:
     """
-    Fetch a rough IV proxy from Deribit and cache for 24h. Falls back to `manual_iv`.
-    Keeps metrics.py self-contained (safe to import without views.py).
+    Fetch IV from Deribit and cache for 24h. Falls back to manual_iv.
     """
     try:
-        import requests  # local import to avoid hard dep if not used
+        import requests
         key = f"deribit_iv_{tenor_days}"
         if cache is not None:
             cached = cache.get(key)
@@ -126,29 +106,28 @@ def _fetch_deribit_iv_cached(tenor_days: int, manual_iv: float) -> float:
 
 # ------------------------- Core Public API ---------------------------------- #
 
-def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray) -> Dict[str, Any]:
+def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray, seed: int = 42) -> Dict[str, Any]:
     """
-    Wraps calculate_metrics and shapes a complete metrics evaluation record
-    including term_sheet with profit_margin, roe_uplift, and savings for each candidate.
+    Evaluates a candidate financing structure, wrapping calculate_metrics.
     """
+    rng = np.random.default_rng(seed)
     tmp = dict(params)
     ctype = candidate.get("type")
     cpar = candidate.get("params", {})
-    # Map candidate parameters to expected keys
+    # Map candidate parameters
+    from risk_calculator.config import DEFAULT_PARAMS
     tmp['LoanPrincipal'] = cpar.get('amount', tmp.get('LoanPrincipal', DEFAULT_PARAMS['LoanPrincipal']))
     tmp['cost_of_debt'] = cpar.get('rate', tmp.get('cost_of_debt', DEFAULT_PARAMS['cost_of_debt']))
     tmp['LTV_Cap'] = cpar.get('ltv_cap', tmp.get('LTV_Cap', DEFAULT_PARAMS['LTV_Cap']))
     tmp['hedge_intensity'] = cpar.get('hedge_intensity', tmp.get('hedge_intensity', 0.0))
     tmp['premium'] = cpar.get('premium', tmp.get('premium', 0.3))
-    # Map preset types back to structures if needed
     if ctype in ("Defensive", "Balanced", "Growth"):
         ctype = cpar.get("structure", ctype)
-    # Transaction economics overlays
     slippage = 0.0
     if ctype == "ATM":
         tmp["capacity"] = params["atm_pct_adv"] * params["adv_30d"]
         Q = tmp["capacity"]
-        H = params.get("t", 1.0) * 12.0  # months
+        H = params.get("t", 1.0) * 12.0
         slippage = almgren_chriss_slippage(Q, params["adv_30d"], H)
         tmp["proceeds"] = Q * (1 - params["pipe_discount"] - params["fees_ecm"] - slippage)
         tmp["new_equity_raised"] = tmp["proceeds"]
@@ -159,26 +138,23 @@ def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_pr
         tmp["proceeds"] = params["LoanPrincipal"] * (1 - params["fees_oid"])
     elif ctype == "Loan":
         tmp["proceeds"] = params["LoanPrincipal"] * (1 - params["fees_oid"])
-    m = calculate_metrics(tmp, btc_prices, vol_heston)
-    # Breach depth uses terminal LTV path
+    m = calculate_metrics(tmp, btc_prices, vol_heston, seed=seed)
     ltv_term = np.asarray(m["ltv"].get("ltv_paths", []), dtype=float)
     ltv_cap = float(tmp["LTV_Cap"])
     over = ltv_term[ltv_term > ltv_cap]
     breach_depth = float(np.mean(over - ltv_cap)) if over.size else 0.0
-    m['breach_depth'] = breach_depth  # Add if needed elsewhere
-    # CVaR: pass-through if enabled
+    m['breach_depth'] = breach_depth
     cvar_val = m["nav"].get("cvar")
-    m['cvar'] = float(cvar_val) if cvar_val is not None else None  # Add top-level if desired
-    # Add structure-specific to term_sheet
+    m['cvar'] = float(cvar_val) if cvar_val is not None else None
     if ctype == "ATM":
         m['term_sheet']['slippage'] = slippage
     return m
 
-def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray) -> Dict[str, Any]:
+def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray, seed: int = 42) -> Dict[str, Any]:
     """
     Path-wise treasury analytics over simulated BTC paths.
-    Assumes btc_prices shape = (N, T) with T monthly steps (per simulate_btc_paths).
     """
+    rng = np.random.default_rng(seed)
     N, T = btc_prices.shape
     if N == 0 or T == 0:
         raise ValueError("btc_prices must be a non-empty (N, T) array")
@@ -189,19 +165,15 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     capex_sched = np.array(params.get("capex_schedule", [0.0] * int(T)), dtype=float)
     if capex_sched.size < T:
         capex_sched = np.pad(capex_sched, (0, T - capex_sched.size), constant_values=0.0)
-    # Covenant & haircuts
     h0 = float(params["haircut_h0"])
     alpha = float(params["haircut_alpha"])
     ltv_cap = float(params["LTV_Cap"])
     liq_penalty = float(params["liquidation_penalty_bps"]) / 10000.0
-    # Hedging IV
     if params.get("deribit_iv_source", "manual") == "live":
         iv = _fetch_deribit_iv_cached(int(params.get("hedge_tenor_days", 90)), float(params.get("manual_iv", 0.55)))
     else:
         iv = float(params.get("manual_iv", 0.55))
-    # Time fraction for one step (monthly grid assumed)
     tau_step = float(params.get("t", 1.0)) / max(T, 1)
-    # State arrays
     cash = np.zeros((N, T), dtype=float)
     cash[:, 0] = initial_cash
     nav = np.zeros((N, T), dtype=float)
@@ -209,54 +181,39 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     hedge_pnl = np.zeros((N, T), dtype=float)
     breach_counts = np.zeros(N, dtype=float)
     cure_success = np.zeros(N, dtype=float)
-    # Assume liabilities other than loan are zero in this model layer
     loan_prin = float(params["LoanPrincipal"])
     cost_of_debt = float(params["cost_of_debt"])
     other_assets = 0.0
     other_liabs = 0.0
-    # NOLs as a vector (do not mutate params)
     nols_remaining = np.full(N, float(params.get("nols", 0.0)), dtype=float)
-    # Step through time
     for t_idx in range(1, T):
-        # Collateral BTC value and realized vol proxy for haircuts
         S_t = btc_prices[:, t_idx]
         v_btc = total_btc * S_t
         vol_t = vol_heston[:, min(t_idx - 1, vol_heston.shape[1] - 1)]
-        haircut_t = np.clip(h0 + alpha * vol_t, 0.05, 0.30)  # clamp 5%–30%
+        haircut_t = np.clip(h0 + alpha * vol_t, 0.05, 0.30)
         collateral = v_btc * (1.0 - haircut_t)
-        # LTV at step
         with np.errstate(divide="ignore", invalid="ignore"):
             ltv_t = np.where(collateral > 0, loan_prin / collateral, np.inf)
-        # track terminal LTV
         if t_idx == T - 1:
             ltv_term[...] = ltv_t
-        # Breaches: margin cures with some probability
         breaches = ltv_t > ltv_cap
         breach_counts += breaches.astype(float)
-        # Margin cure: liquidate just enough collateral notionally (simplified)
         idxs = np.where(breaches)[0]
         if idxs.size:
-            # amount above cap as a fraction of collat value
             excess = (ltv_t[idxs] - ltv_cap) * collateral[idxs]
-            # assume cure succeeds with 70% probability; failure -> no cure this step
-            success_mask = (np.random.random(size=idxs.size) < 0.70)
+            success_mask = (rng.random(size=idxs.size) < 0.70)
             liq_amt = np.zeros_like(excess)
             liq_amt[success_mask] = excess[success_mask]
-            # cash impact: liquidation penalty
             cash[idxs, t_idx] -= liq_amt * (1.0 + liq_penalty)
             cure_success[idxs] += success_mask.astype(float)
-        # Cash flows this step
-        interest = loan_prin * cost_of_debt / 12.0  # monthly
+        interest = loan_prin * cost_of_debt / 12.0
         capex = capex_sched[t_idx] if t_idx < capex_sched.size else 0.0
-        # Hedging: protective put on fraction of BTC
         hedge_cost = 0.0
         hedge_gain = 0.0
         if params.get("hedge_policy", "none") == "protective_put":
             hedge_frac = float(params.get("hedge_intensity", 0.0))
             if hedge_frac > 0:
-                # Notional per path: hedge_frac * total_btc at strike K = S_t * (1 - hedge_frac)
                 K = S_t * (1.0 - hedge_frac)
-                # Use scalar BS with average S for premium proxy, then scale by v_btc
                 S_mid = float(np.mean(S_t))
                 put_unit = _bs_put_price(
                     S_mid,
@@ -266,58 +223,47 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
                     iv,
                     tau_step
                 )
-                # Premium proportional to notional hedged (approximation)
                 hedge_cost = hedge_frac * put_unit * total_btc
-                # Realized payoff next step (if next price < K)
                 S_next = btc_prices[:, min(t_idx + 1, T - 1)]
                 payoff = np.maximum(K - S_next, 0.0)
                 hedge_gain = hedge_frac * payoff * total_btc
             hedge_pnl[:, t_idx] = hedge_gain - hedge_cost
-        # Margin call cash usage is already applied above
         cash_delta = -monthly_burn - capex - interest - hedge_cost + hedge_gain
         cash[:, t_idx] = cash[:, t_idx - 1] + cash_delta
-        # Simple tax on positive hedge gains after NOL offsets
         taxable = np.maximum(0.0, hedge_gain - nols_remaining)
         tax = taxable * float(params["tax_rate"])
         cash[:, t_idx] -= tax
         nols_remaining = np.maximum(0.0, nols_remaining - hedge_gain)
-        # NAV = (cash + BTC + other assets) - (loan + other liabs)
         nav[:, t_idx] = cash[:, t_idx] + v_btc + other_assets - (loan_prin + other_liabs)
-    # Runway: first month index where cash < 0, else T
     runway = np.full(N, T, dtype=float)
     for i in range(N):
         neg = np.where(cash[i] < 0.0)[0]
         if neg.size:
             runway[i] = float(neg[0])
-    # Terminal metrics
     nav_T = nav[:, -1]
     avg_nav = float(np.mean(nav_T))
     logger.info(f"Terminal NAV: avg_nav={avg_nav:.2f}, min_nav={np.min(nav_T):.2f}, max_nav={np.max(nav_T):.2f}")
     ci_nav = float(1.96 * np.std(nav_T, ddof=1) / np.sqrt(max(N, 1)))
     erosion_prob = float(np.mean(nav_T < 0.9 * avg_nav)) if avg_nav != 0 else 0.0
-    # CVaR(95) on NAV if enabled
     cvar_val = None
     if params.get("cvar_on", True):
         q = np.percentile(nav_T, 5.0)
         tail = nav_T[nav_T <= q]
         cvar_val = float(np.mean(tail)) if tail.size else float(q)
-    # Bootstrap CI on erosion probability (for display)
     bs_samples = int(params.get("bootstrap_samples", 1000))
     bs_eros = []
     if bs_samples > 0:
         for _ in range(bs_samples):
-            res = np.random.choice(nav_T, size=N, replace=True)
+            res = rng.choice(nav_T, size=N, replace=True)
             mu = np.mean(res)
             bs_eros.append(np.mean(res < 0.9 * mu) if mu != 0 else 0.0)
     ci_eros_lo = float(np.percentile(bs_eros, 2.5)) if bs_eros else erosion_prob
     ci_eros_hi = float(np.percentile(bs_eros, 97.5)) if bs_eros else erosion_prob
-    # Dilution model
     base_dilution = float(params["new_equity_raised"]) / float(params["initial_equity_value"] + params["new_equity_raised"])
     dil_paths = np.array([
-        base_dilution * (1.0 + params["dilution_vol_estimate"] * np.random.normal())
+        base_dilution * (1.0 + params["dilution_vol_estimate"] * rng.normal())
         for _ in range(N)
     ], dtype=float)
-    # Convertible overlay (TSM-style proxy)
     if params.get("structure") == "Convertible":
         S_term = float(np.mean(btc_prices[:, -1]))
         vol_term = float(max(np.mean(vol_heston[:, -1]), 1e-6))
@@ -339,7 +285,6 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             conversion_ratio / (float(params["shares_fd"]) + conversion_ratio) if (float(params["shares_fd"]) + conversion_ratio) > 0 else 0.0,
             dtype=float
         )
-    # LTV terminal distribution (use terminal point)
     with np.errstate(divide="ignore", invalid="ignore"):
         ltv_terminal = np.where(
             total_btc * btc_prices[:, -1] > 0,
@@ -349,7 +294,6 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     avg_ltv = float(np.mean(ltv_terminal))
     ci_ltv = float(1.96 * np.std(ltv_terminal, ddof=1) / np.sqrt(max(N, 1)))
     exceed_prob = float(np.mean(ltv_terminal > ltv_cap))
-    # ROE (CAPM-style, leverage adjusted)
     rf = float(params["risk_free_rate"])
     beta = float(params["beta_ROE"])
     exp_btc = float(params["expected_return_btc"])
@@ -357,9 +301,8 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     leverage = loan_prin / float(params["initial_equity_value"] + params["new_equity_raised"])
     roe = roe_base * (1.0 + leverage * (1.0 - float(np.mean(dil_paths))))
     avg_roe = float(np.mean(roe))
-    ci_roe = 0.0  # deterministic over paths in this layer
-    sharpe = float((avg_roe - rf) / (np.std([roe], ddof=1) if False else max(1e-9, 0.01)))  # display only
-    # Scenarios (deterministic slices)
+    ci_roe = 0.0
+    sharpe = float((avg_roe - rf) / (np.std([roe], ddof=1) if False else max(1e-9, 0.01)))
     scenarios = {
         "Bull Case": {"price_multiplier": 1.5, "probability": 0.25},
         "Base Case": {"price_multiplier": 1.0, "probability": 0.40},
@@ -377,7 +320,6 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             "ltv_ratio": float(loan_prin / (total_btc * price) if total_btc > 0 else np.inf),
             "probability": float(cfg["probability"]),
         }
-    # Distribution of terminal BTC price
     final_btc = btc_prices[:, -1]
     distribution_metrics = {
         "bull_market_prob": float(np.mean(final_btc >= params["BTC_current_market_price"] * 1.5)),
@@ -406,15 +348,10 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             },
         },
     }
-    # Term sheet & business impact (kept keys for CSV/PDF expectations)
     profit_margin = float((cost_of_debt - rf) / cost_of_debt) if cost_of_debt > 0 else 0.0
     logger.info(f"Calculating profit_margin: cost_of_debt={cost_of_debt}, rf={rf}, profit_margin={profit_margin}")
-    avg_conv_value = 0.0  # optionally compute/return if needed for displays
     roe_uplift = float(avg_roe - exp_btc)
-    # A proxy "savings" vs. base dilution (kept for Views CSV export compatibility)
-    # Approximates avoided dilution dollars vs. issuing common stock
-    mkt_px = float(np.mean(final_btc))
-    base_dil_dollars = base_dilution * float(params["initial_equity_value"])  # in equity units; display proxy
+    base_dil_dollars = base_dilution * float(params["initial_equity_value"])
     realized_dil_dollars = float(np.mean(dil_paths)) * float(params["initial_equity_value"])
     savings = float(base_dil_dollars - realized_dil_dollars)
     term_sheet = {
@@ -428,18 +365,17 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         "btc_bought": float(params.get("BTC_purchased", 0.0)),
         "total_btc_treasury": float(total_btc),
         "savings": savings,
-        "roe_uplift": roe_uplift * 100.0,  # % points
+        "roe_uplift": roe_uplift * 100.0,
         "profit_margin": profit_margin,
     }
     business_impact = {
         "btc_could_buy": float(loan_prin / params["BTC_current_market_price"] if params["BTC_current_market_price"] > 0 else 0.0),
         "savings": savings,
-        "kept_money": savings,  # simple alias
+        "kept_money": savings,
         "roe_uplift": roe_uplift * 100.0,
         "reduced_risk": erosion_prob,
         "profit_margin": profit_margin,
     }
-    # Runway stats (T is months if simulate uses monthly steps)
     runway_stats = {
         "dist_mean": float(np.mean(runway)),
         "p50": float(np.median(runway)),
@@ -455,7 +391,6 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             "cvar": cvar_val,
             "ci_erosion_lower": ci_eros_lo,
             "ci_erosion_upper": ci_eros_hi,
-            # Full terminal paths for MC variance check in views.py
             "nav_paths": nav_T.tolist(),
         },
         "dilution": {
@@ -468,7 +403,6 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             "ci_lower": avg_ltv - ci_ltv,
             "ci_upper": avg_ltv + ci_ltv,
             "exceed_prob": exceed_prob,
-            # terminal LTV paths (used by evaluate_candidate for breach depth)
             "ltv_paths": ltv_terminal.tolist(),
         },
         "roe": {

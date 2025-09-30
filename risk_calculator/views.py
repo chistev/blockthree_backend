@@ -517,6 +517,9 @@ def run_calculation(data, snapshot_id):
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
 
+        # FIX: Add seed for reproducibility
+        calculation_seed = data.get('seed', 42)
+
         # Inject IV
         if params.get('deribit_iv_source') == 'live':
             params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
@@ -535,16 +538,17 @@ def run_calculation(data, snapshot_id):
                     params['targetBTCPrice'] = btc_price
 
         # Single simulation pass for optimization and candidate evaluation
-        cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}"
+        # FIX: Include seed in cache_key
+        cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{calculation_seed}"
         cached_simulation = cache.get(cache_key)
         if cached_simulation:
             btc_prices, vol_heston = cached_simulation
         else:
-            btc_prices, vol_heston = simulate_btc_paths(params, seed=42)
+            btc_prices, vol_heston = simulate_btc_paths(params, seed=calculation_seed)  # FIX: Pass seed
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)  # Cache for 1 hour
 
         # Optimize with fewer candidates
-        candidates = optimize_for_corporate_treasury(params, btc_prices, vol_heston)
+        candidates = optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed=calculation_seed)  # FIX: Pass seed (see optimization.py changes)
         if not candidates:
             raise ValueError("Optimization failed to produce candidates")
 
@@ -555,7 +559,7 @@ def run_calculation(data, snapshot_id):
             return {
                 'type': cand['type'],
                 'params': cand['params'],
-                'metrics': evaluate_candidate(temp_params, cand, btc_prices, vol_heston)
+                'metrics': evaluate_candidate(temp_params, cand, btc_prices, vol_heston, seed=calculation_seed)  # FIX: Pass seed
             }
 
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -567,7 +571,14 @@ def run_calculation(data, snapshot_id):
         stable_params.update(balanced['params'])
 
         # Reuse simulation if parameters haven't changed significantly
-        final_metrics = calculate_metrics(stable_params, btc_prices, vol_heston)
+        # FIX: Include seed in metrics_cache_key and pass to calculate_metrics
+        metrics_cache_key = f"metrics_{cache_key}"
+        cached_metrics = cache.get(metrics_cache_key)
+        if cached_metrics:
+            final_metrics = cached_metrics
+        else:
+            final_metrics = calculate_metrics(stable_params, btc_prices, vol_heston, seed=calculation_seed)
+            cache.set(metrics_cache_key, final_metrics, timeout=3600)
 
         logger.info("=== CALCULATION RESULTS DEBUG ===")
         logger.info(f"Final metrics keys: {final_metrics.keys()}")
@@ -662,6 +673,9 @@ def what_if(request):
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
 
+        # FIX: Add seed
+        calculation_seed = data.get('seed', 42)
+
         if params.get('deribit_iv_source') == 'live':
             params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
         else:
@@ -676,23 +690,24 @@ def what_if(request):
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
 
-        cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}"
+        # FIX: Include seed in cache_key
+        cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{calculation_seed}"
         cached_simulation = cache.get(cache_key)
         if cached_simulation:
             btc_prices, vol_heston = cached_simulation
         else:
-            btc_prices, vol_heston = simulate_btc_paths(params, seed=42)
+            btc_prices, vol_heston = simulate_btc_paths(params, seed=calculation_seed)
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
 
         if value in ['optimize', 'maximize'] or param == 'optimize_all':
-            opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, max_candidates=3)
+            opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, max_candidates=3, seed=calculation_seed)  # FIX: Pass seed
             if opts:
                 balanced = next((c for c in opts if c['type'] == 'Balanced'), opts[0])
                 params.update(balanced['params'])
         else:
             params[param] = float(value)
 
-        final_data = calculate_metrics(params, btc_prices, vol_heston)
+        final_data = calculate_metrics(params, btc_prices, vol_heston, seed=calculation_seed)  # FIX: Pass seed
 
         if params['export_format'] == 'csv':
             return generate_csv_response(final_data, [{'type': 'What-If', 'params': final_data['term_sheet'], 'metrics': final_data}])
@@ -730,7 +745,7 @@ def reproduce_run(request):
             btc_prices, vol_heston = simulate_btc_paths(params, seed=seed)
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
 
-        metrics = calculate_metrics(params, btc_prices, vol_heston)
+        metrics = calculate_metrics(params, btc_prices, vol_heston, seed=seed)  # FIX: Pass seed
         resp = {
             'metrics': metrics,
             'snapshot_id': snapshot_id,
