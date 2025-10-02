@@ -27,8 +27,12 @@ from functools import lru_cache
 from risk_calculator.utils.metrics import calculate_metrics, evaluate_candidate
 from risk_calculator.utils.optimization import optimize_for_corporate_treasury
 from risk_calculator.utils.simulation import simulate_btc_paths
+import jwt
+import datetime
+import traceback
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging to include stack traces
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 PRESET_MAPPINGS = {
@@ -75,13 +79,18 @@ def login(request):
         
         # Check if password exists and is active
         if PasswordAccess.objects.filter(password=password, is_active=True).exists():
-            request.session['is_authenticated'] = True
-            request.session.set_expiry(0)  # Session expires when browser closes
-            return JsonResponse({'message': 'Login successful'}, status=200)
+            # Generate JWT token
+            payload = {
+                'user': 'anonymous',
+                'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24),
+                'iat': datetime.datetime.now(datetime.timezone.utc)
+            }
+            token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm='HS256')
+            return JsonResponse({'message': 'Login successful', 'token': token}, status=200)
         else:
             return JsonResponse({'error': 'Invalid or inactive password'}, status=401)
     except Exception as e:
-        logger.error(f"Login error: {e}")
+        logger.error(f"Login error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
 
 @require_GET
@@ -97,14 +106,25 @@ def fetch_btc_price_cached():
         cache_key = 'btc_price'
         cached = cache.get(cache_key)
         if cached is not None:
+            logger.info(f"Returning cached BTC price: {cached}")
             return cached
         r = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=3)
         r.raise_for_status()
-        price = r.json()['bitcoin']['usd']
+        data = r.json()
+        if 'bitcoin' not in data or 'usd' not in data['bitcoin']:
+            raise ValueError("Invalid response format from CoinGecko API")
+        price = float(data['bitcoin']['usd'])
         cache.set(cache_key, price, timeout=300)
+        logger.info(f"Fetched and cached BTC price: {price}")
         return price
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error fetching BTC price: {e}\n{traceback.format_exc()}")
+        return None
+    except (KeyError, ValueError) as e:
+        logger.error(f"Data parsing error fetching BTC price: {e}\n{traceback.format_exc()}")
+        return None
     except Exception as e:
-        logger.error(f"Live BTC price fetch failed: {e}")
+        logger.error(f"Unexpected error fetching BTC price: {e}\n{traceback.format_exc()}")
         return None
 
 @lru_cache(maxsize=128)
@@ -132,7 +152,7 @@ def fetch_deribit_iv_cached(tenor_days: int) -> float:
         cache.set(cache_key, iv_ret, timeout=24*3600)
         return iv_ret
     except Exception as e:
-        logger.error(f"Deribit IV fetch failed: {e}")
+        logger.error(f"Deribit IV fetch failed: {e}\n{traceback.format_exc()}")
         return DEFAULT_PARAMS['manual_iv']
 
 def validate_inputs(params):
@@ -159,21 +179,27 @@ def validate_inputs(params):
 
 def fetch_sec_data(ticker):
     try:
+        cache_key = f'sec_data_{ticker}'
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.info(f"Returning cached SEC data for {ticker}: {cached}")
+            return cached
+
         api_key = settings.ALPHA_VANTAGE_API_KEY
         if not api_key:
             raise ValueError("Alpha Vantage API key is invalid or missing. Check your .env file.")
 
         @retry(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=4, max=10),
+            stop=stop_after_attempt(5),  # Increased retries
+            wait=wait_exponential(multiplier=1, min=4, max=20),  # Increased max wait
             retry=retry_if_exception_type(requests.exceptions.RequestException),
             before_sleep=lambda retry_state: logger.warning(
-                f"Retrying Alpha Vantage API call (attempt {retry_state.attempt_number})..."
+                f"Retrying Alpha Vantage API call for {ticker} (attempt {retry_state.attempt_number})..."
             )
         )
         def make_api_call():
             url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={ticker}&apikey={api_key}"
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, timeout=20)  # Increased timeout
             response.raise_for_status()
             return response.json()
 
@@ -201,11 +227,23 @@ def fetch_sec_data(ticker):
             'new_equity_raised': new_equity_raised if new_equity_raised > 0 else DEFAULT_PARAMS['new_equity_raised'],
         }
 
-        logger.info(f"Fetched Alpha Vantage data for {ticker}: {result}")
+        cache.set(cache_key, result, timeout=24*3600)  # Cache for 24 hours
+        logger.info(f"Fetched and cached Alpha Vantage data for {ticker}: {result}")
         return result
 
+    except requests.exceptions.ConnectionError as e:
+        if "NameResolutionError" in str(e):
+            logger.error(f"DNS resolution failed for Alpha Vantage API: {e}\n{traceback.format_exc()}")
+            return {
+                'error': f"DNS resolution failed for ticker {ticker}. Using default values.",
+                'initial_equity_value': DEFAULT_PARAMS['initial_equity_value'],
+                'LoanPrincipal': DEFAULT_PARAMS['LoanPrincipal'],
+                'new_equity_raised': DEFAULT_PARAMS['new_equity_raised'],
+            }
+        logger.error(f"Network error fetching Alpha Vantage data for {ticker}: {e}\n{traceback.format_exc()}")
+        return {'error': str(e)}
     except Exception as e:
-        logger.error(f"Failed to fetch Alpha Vantage data for {ticker}: {str(e)}")
+        logger.error(f"Failed to fetch Alpha Vantage data for {ticker}: {str(e)}\n{traceback.format_exc()}")
         return {'error': str(e)}
 
 def parse_sec_file(file, ticker):
@@ -308,8 +346,7 @@ def parse_sec_file(file, ticker):
         return result
         
     except Exception as e:
-        logger.error(f"Failed to parse SEC file: {e}")
-        logger.error(f"Error details: {str(e)}", exc_info=True)
+        logger.error(f"Failed to parse SEC file: {e}\n{traceback.format_exc()}")
         return {'error': f"Failed to parse {ext.upper()} file: {e}"}
 
 @csrf_exempt
@@ -321,7 +358,7 @@ def get_default_params(request):
             resp[f'{k}_source'] = 'Default'
         return JsonResponse(resp)
     except Exception as e:
-        logger.error(f"Get default params error: {e}")
+        logger.error(f"Get default params error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=500)
 
 @csrf_exempt
@@ -337,7 +374,7 @@ def fetch_sec_data_endpoint(request):
             return JsonResponse({'error': out['error']}, status=400)
         return JsonResponse(out)
     except Exception as e:
-        logger.error(f"Fetch SEC data endpoint error: {e}")
+        logger.error(f"Fetch SEC data endpoint error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
 
 @csrf_exempt
@@ -356,7 +393,7 @@ def upload_sec_data(request):
             return JsonResponse({'error': out['error']}, status=400)
         return JsonResponse(out)
     except Exception as e:
-        logger.error(f"Upload SEC data endpoint error: {e}")
+        logger.error(f"Upload SEC data endpoint error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': f"Failed to process file: {e}"}, status=400)
 
 @csrf_exempt
@@ -387,7 +424,7 @@ def lock_snapshot(request):
                 timestamp=ts,
                 params_json=json.dumps(params),
                 mode=mode,
-                user=request.user.username if getattr(request, 'user', None) and request.user.is_authenticated else 'anonymous'
+                user=request.jwt_payload.get('user', 'anonymous') if hasattr(request, 'jwt_payload') else 'anonymous'
             )
             logger.info(f"Created new snapshot with ID {snap.id} for hash {hash_val}")
             return JsonResponse({
@@ -397,7 +434,7 @@ def lock_snapshot(request):
                 'mode': mode
             })
     except Exception as e:
-        logger.error(f"Lock snapshot error: {e}")
+        logger.error(f"Lock snapshot error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
 
 def generate_csv_response(metrics, candidates):
@@ -598,9 +635,7 @@ def run_calculation(data, snapshot_id):
         return payload
 
     except Exception as e:
-        logger.error(f"Calculation error: {e}")
-        if params.get('export_format', 'json') in ['csv', 'pdf']:
-            return HttpResponse(f"Error: {e}", content_type='text/plain', status=400)
+        logger.error(f"Calculation error: {e}\n{traceback.format_exc()}")
         return {'error': str(e)}
 
 @csrf_exempt
@@ -616,19 +651,22 @@ def calculate(request):
             return result
         return JsonResponse(result)
     except Exception as e:
-        logger.error(f"Calculate endpoint error: {e}")
+        logger.error(f"Calculate endpoint error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
 
 @csrf_exempt
 def get_btc_price(request):
     try:
+        # Log request headers for debugging
+        logger.debug(f"Request headers: {dict(request.headers)}")
         p = fetch_btc_price_cached()
         if p is None:
+            logger.error("BTC price is None after fetch attempt")
             return JsonResponse({'error': 'Failed to fetch live BTC price'}, status=500)
         return JsonResponse({'BTC_current_market_price': p})
     except Exception as e:
-        logger.error(f"Get BTC price error: {e}")
-        return JsonResponse({'error': str(e)}, status=500)
+        logger.error(f"Get BTC price error: {e}\n{traceback.format_exc()}")
+        return JsonResponse({'error': f"Failed to fetch BTC price: {str(e)}"}, status=500)
 
 @csrf_exempt
 @require_POST
@@ -687,7 +725,7 @@ def what_if(request):
             return generate_pdf_response(final_data, [{'type': 'What-If', 'params': final_data['term_sheet'], 'metrics': final_data}], title="What-If Analysis Report")
         return JsonResponse(final_data)
     except Exception as e:
-        logger.error(f"What-If endpoint error: {e}")
+        logger.error(f"What-If endpoint error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
 
 @csrf_exempt
@@ -731,7 +769,7 @@ def reproduce_run(request):
             return generate_pdf_response(metrics, [{'type': 'Reproduced', 'params': metrics['term_sheet'], 'metrics': metrics}], title="Reproduced Run Report")
         return JsonResponse(resp)
     except Exception as e:
-        logger.error(f"Reproduce run error: {e}")
+        logger.error(f"Reproduce run error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
 
 @csrf_exempt
@@ -780,5 +818,5 @@ def get_audit_trail(request):
         return JsonResponse({'audit_trail': audit_entries})
         
     except Exception as e:
-        logger.error(f"Audit trail error: {e}")
+        logger.error(f"Audit trail error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=500)
