@@ -45,6 +45,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'risk_calculator.middleware.PasswordProtectionMiddleware'
 ]
 
 # Allow all origins for simplicity (adjust as needed for production)

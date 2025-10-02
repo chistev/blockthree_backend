@@ -3,9 +3,8 @@ from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_POST, require_GET
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
-
 from risk_calculator.config import DEFAULT_PARAMS
-from .models import Snapshot
+from .models import Snapshot, PasswordAccess
 import numpy as np
 import requests
 import json
@@ -20,11 +19,8 @@ import pdfplumber
 import pandas as pd
 import re
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
-from sec_api import QueryApi, ExtractorApi
 import hashlib
-import datetime
 from difflib import SequenceMatcher
-from jsonpatch import JsonPatch
 from django.core.cache import cache
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -56,7 +52,6 @@ PRESET_MAPPINGS = {
     }
 }
 
-# Precompile regex patterns for SEC parsing
 REGEX_PATTERNS = {
     'initial_equity_value': re.compile(r"Total\s+Shareholders?\s+Equity\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
     'LoanPrincipal': re.compile(r"Long[-\s]?Term\s+Debt\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
@@ -69,12 +64,28 @@ REGEX_PATTERNS = {
     'capex': re.compile(r"Capital\s+Expenditures\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
 }
 
+@csrf_exempt
+@require_POST
+def login(request):
+    try:
+        data = json.loads(request.body.decode('utf-8'))
+        password = data.get('password')
+        if not password:
+            return JsonResponse({'error': 'Password is required'}, status=400)
+        
+        # Check if password exists and is active
+        if PasswordAccess.objects.filter(password=password, is_active=True).exists():
+            request.session['is_authenticated'] = True
+            request.session.set_expiry(0)  # Session expires when browser closes
+            return JsonResponse({'message': 'Login successful'}, status=200)
+        else:
+            return JsonResponse({'error': 'Invalid or inactive password'}, status=401)
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        return JsonResponse({'error': str(e)}, status=400)
+
 @require_GET
 def get_presets(request):
-    """
-    API endpoint to retrieve preset mappings.
-    Returns a JSON object containing the preset configurations.
-    """
     return JsonResponse(PRESET_MAPPINGS, status=200)
 
 def get_json_data(request):
@@ -90,12 +101,12 @@ def fetch_btc_price_cached():
         r = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=3)
         r.raise_for_status()
         price = r.json()['bitcoin']['usd']
-        cache.set(cache_key, price, timeout=300)  # Cache for 5 minutes
+        cache.set(cache_key, price, timeout=300)
         return price
     except Exception as e:
         logger.error(f"Live BTC price fetch failed: {e}")
         return None
-    
+
 @lru_cache(maxsize=128)
 def fetch_deribit_iv_cached(tenor_days: int) -> float:
     try:
@@ -123,7 +134,7 @@ def fetch_deribit_iv_cached(tenor_days: int) -> float:
     except Exception as e:
         logger.error(f"Deribit IV fetch failed: {e}")
         return DEFAULT_PARAMS['manual_iv']
-    
+
 def validate_inputs(params):
     errors = []
     for k in ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice', 'IssuePrice', 'LoanPrincipal']:
@@ -133,8 +144,6 @@ def validate_inputs(params):
         errors.append("BTC_purchased cannot be negative")
     if params.get('paths', 0) < 1:
         errors.append("paths must be at least 1")
-    # if params.get('min_profit_margin', 0) <= 0:
-    #     errors.append("min_profit_margin must be positive")
     if params.get('long_run_volatility', 0) == 0:
         errors.append("long_run_volatility cannot be zero")
     if params.get('shares_basic', 0) <= 0 or params.get('shares_fd', 0) < params.get('shares_basic', 0):
@@ -147,19 +156,16 @@ def validate_inputs(params):
         errors.append("Optimizer constraints must be positive")
     if errors:
         raise ValueError("; ".join(errors))
-    
+
 def fetch_sec_data(ticker):
-    """
-    Fetch financial data for a given ticker using Alpha Vantage API.
-    """
     try:
         api_key = settings.ALPHA_VANTAGE_API_KEY
         if not api_key:
             raise ValueError("Alpha Vantage API key is invalid or missing. Check your .env file.")
 
         @retry(
-            stop=stop_after_attempt(3),  # Retry up to 3 times
-            wait=wait_exponential(multiplier=1, min=4, max=10),  # 4s, 8s, 10s
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=4, max=10),
             retry=retry_if_exception_type(requests.exceptions.RequestException),
             before_sleep=lambda retry_state: logger.warning(
                 f"Retrying Alpha Vantage API call (attempt {retry_state.attempt_number})..."
@@ -172,14 +178,11 @@ def fetch_sec_data(ticker):
             return response.json()
 
         data = make_api_call()
-
-        # Handle rate limit or missing data
         if 'annualReports' not in data:
             if 'Information' in data and 'API rate limit' in data['Information']:
                 raise ValueError("Alpha Vantage API rate limit exceeded. Please try again later.")
             raise ValueError(f"No balance sheet data found for ticker {ticker}")
 
-        # Get latest annual report
         latest_report = data['annualReports'][0]
 
         def safe_float(value, default=0.0):
@@ -190,8 +193,7 @@ def fetch_sec_data(ticker):
 
         total_equity = safe_float(latest_report.get('totalShareholderEquity'))
         total_debt = safe_float(latest_report.get('longTermDebt'))
-        # Not exact, but closest available from balance sheet
-        new_equity_raised = safe_float(latest_report.get('capitalStock'))  
+        new_equity_raised = safe_float(latest_report.get('capitalStock'))
 
         result = {
             'initial_equity_value': total_equity if total_equity > 0 else DEFAULT_PARAMS['initial_equity_value'],
@@ -238,23 +240,19 @@ def parse_sec_file(file, ticker):
                         result['capex_schedule'] = [0.0]*12
                         result['capex_schedule_source'] = 'Default'
         else:
-            # Improved CSV/Excel parsing
             if ext == 'xlsx':
                 df = pd.read_excel(file)
-            else:  # CSV
+            else:
                 df = pd.read_csv(file)
             
             logger.info(f"File columns: {df.columns.tolist()}")
             logger.info(f"File shape: {df.shape}")
             logger.info(f"First few rows:\n{df.head()}")
             
-            # Handle different CSV formats
             if len(df.columns) == 2 and 'Metric' in df.columns and 'Value' in df.columns:
-                # Format: Metric,Value (like your test file)
                 metric_dict = dict(zip(df['Metric'], df['Value']))
                 logger.info(f"Extracted metrics: {metric_dict}")
                 
-                # Map metric names to parameter names
                 mapping = {
                     'Total Shareholder Equity': 'initial_equity_value',
                     'Long-Term Debt': 'LoanPrincipal', 
@@ -270,17 +268,13 @@ def parse_sec_file(file, ticker):
                 for metric_name, param_name in mapping.items():
                     if metric_name in metric_dict:
                         value = metric_dict[metric_name]
-                        # Handle percentage values
                         if 'Tax Rate' in metric_name and isinstance(value, str) and '%' in value:
                             value = float(value.replace('%', '')) / 100.0
                         elif isinstance(value, str):
-                            # Remove commas and convert to float
                             value = float(value.replace(',', ''))
                         
-                        # Special handling for monthly values
                         if param_name == 'opex_monthly':
-                            # If annual expense, convert to monthly
-                            if value > 1000000:  # Likely annual if large
+                            if value > 1000000:
                                 value = value / 12.0
                         
                         result[param_name] = value
@@ -288,7 +282,6 @@ def parse_sec_file(file, ticker):
                         logger.info(f"Mapped {metric_name} -> {param_name} = {value}")
             
             else:
-                # Original logic for other formats
                 target_cols = {
                     'initial_equity_value': ['Total Shareholder Equity', 'Shareholder Equity', 'Total Equity'],
                     'LoanPrincipal': ['Long-Term Debt', 'Total Debt', 'Debt'],
@@ -318,7 +311,7 @@ def parse_sec_file(file, ticker):
         logger.error(f"Failed to parse SEC file: {e}")
         logger.error(f"Error details: {str(e)}", exc_info=True)
         return {'error': f"Failed to parse {ext.upper()} file: {e}"}
-    
+
 @csrf_exempt
 def get_default_params(request):
     try:
@@ -376,10 +369,8 @@ def lock_snapshot(request):
         if mode not in ['public', 'private', 'pro-forma']:
             return JsonResponse({'error': 'Invalid mode'}, status=400)
         
-        # Generate hash for the snapshot
         hash_val = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
         
-        # Check if a snapshot with this hash already exists
         try:
             snap = Snapshot.objects.get(hash=hash_val)
             logger.info(f"Reusing existing snapshot with ID {snap.id} for hash {hash_val}")
@@ -390,8 +381,7 @@ def lock_snapshot(request):
                 'mode': snap.mode
             })
         except Snapshot.DoesNotExist:
-            # Create new snapshot if no existing one is found
-            ts = timezone.now()  # Use timezone-aware datetime
+            ts = timezone.now()
             snap = Snapshot.objects.create(
                 hash=hash_val,
                 timestamp=ts,
@@ -409,7 +399,7 @@ def lock_snapshot(request):
     except Exception as e:
         logger.error(f"Lock snapshot error: {e}")
         return JsonResponse({'error': str(e)}, status=400)
-    
+
 def generate_csv_response(metrics, candidates):
     output = StringIO()
     writer = csv.writer(output)
@@ -462,7 +452,6 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
     
     for c in candidates:
         m = c['metrics']
-        # Use correct key structure from metrics.py
         nav_data = m.get('nav', {})
         dilution_data = m.get('dilution', {})
         ltv_data = m.get('ltv', {})
@@ -516,20 +505,15 @@ def run_calculation(data, snapshot_id):
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
-
-        # FIX: Add seed for reproducibility
         calculation_seed = data.get('seed', 42)
 
-        # Inject IV
         if params.get('deribit_iv_source') == 'live':
             params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
         else:
             params['option_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
 
-        # Validate inputs once
         validate_inputs(params)
 
-        # Fetch live BTC price if needed
         if params['use_live']:
             btc_price = fetch_btc_price_cached()
             if btc_price:
@@ -537,41 +521,34 @@ def run_calculation(data, snapshot_id):
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
 
-        # Single simulation pass for optimization and candidate evaluation
-        # FIX: Include seed in cache_key
         cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{calculation_seed}"
         cached_simulation = cache.get(cache_key)
         if cached_simulation:
             btc_prices, vol_heston = cached_simulation
         else:
-            btc_prices, vol_heston = simulate_btc_paths(params, seed=calculation_seed)  # FIX: Pass seed
-            cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)  # Cache for 1 hour
+            btc_prices, vol_heston = simulate_btc_paths(params, seed=calculation_seed)
+            cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
 
-        # Optimize with fewer candidates
-        candidates = optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed=calculation_seed)  # FIX: Pass seed (see optimization.py changes)
+        candidates = optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed=calculation_seed)
         if not candidates:
             raise ValueError("Optimization failed to produce candidates")
 
-        # Parallelize candidate evaluation
         def evaluate_candidate_wrapper(cand):
             temp_params = params.copy()
             temp_params.update(cand['params'])
             return {
                 'type': cand['type'],
                 'params': cand['params'],
-                'metrics': evaluate_candidate(temp_params, cand, btc_prices, vol_heston, seed=calculation_seed)  # FIX: Pass seed
+                'metrics': evaluate_candidate(temp_params, cand, btc_prices, vol_heston, seed=calculation_seed)
             }
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             candidate_results = list(executor.map(evaluate_candidate_wrapper, candidates))
 
-        # Select Balanced candidate or first
         balanced = next((c for c in candidates if c['type'] == 'Balanced'), candidates[0])
         stable_params = params.copy()
         stable_params.update(balanced['params'])
 
-        # Reuse simulation if parameters haven't changed significantly
-        # FIX: Include seed in metrics_cache_key and pass to calculate_metrics
         metrics_cache_key = f"metrics_{cache_key}"
         cached_metrics = cache.get(metrics_cache_key)
         if cached_metrics:
@@ -599,7 +576,6 @@ def run_calculation(data, snapshot_id):
         
         logger.info("=== END DEBUG ===")
 
-        # Check Monte Carlo stability
         nav_paths = np.array(final_metrics.get('nav', {}).get('nav_paths_preview', []))
         if nav_paths.size > 0:
             est_se = np.std(nav_paths) / max(1, np.sqrt(min(len(nav_paths), params['paths'])))
@@ -643,7 +619,6 @@ def calculate(request):
         logger.error(f"Calculate endpoint error: {e}")
         return JsonResponse({'error': str(e)}, status=400)
 
-
 @csrf_exempt
 def get_btc_price(request):
     try:
@@ -672,8 +647,6 @@ def what_if(request):
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
-
-        # FIX: Add seed
         calculation_seed = data.get('seed', 42)
 
         if params.get('deribit_iv_source') == 'live':
@@ -690,7 +663,6 @@ def what_if(request):
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
 
-        # FIX: Include seed in cache_key
         cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{calculation_seed}"
         cached_simulation = cache.get(cache_key)
         if cached_simulation:
@@ -700,14 +672,14 @@ def what_if(request):
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
 
         if value in ['optimize', 'maximize'] or param == 'optimize_all':
-            opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, max_candidates=3, seed=calculation_seed)  # FIX: Pass seed
+            opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, max_candidates=3, seed=calculation_seed)
             if opts:
                 balanced = next((c for c in opts if c['type'] == 'Balanced'), opts[0])
                 params.update(balanced['params'])
         else:
             params[param] = float(value)
 
-        final_data = calculate_metrics(params, btc_prices, vol_heston, seed=calculation_seed)  # FIX: Pass seed
+        final_data = calculate_metrics(params, btc_prices, vol_heston, seed=calculation_seed)
 
         if params['export_format'] == 'csv':
             return generate_csv_response(final_data, [{'type': 'What-If', 'params': final_data['term_sheet'], 'metrics': final_data}])
@@ -717,7 +689,7 @@ def what_if(request):
     except Exception as e:
         logger.error(f"What-If endpoint error: {e}")
         return JsonResponse({'error': str(e)}, status=400)
-    
+
 @csrf_exempt
 @require_POST
 def reproduce_run(request):
@@ -745,7 +717,7 @@ def reproduce_run(request):
             btc_prices, vol_heston = simulate_btc_paths(params, seed=seed)
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
 
-        metrics = calculate_metrics(params, btc_prices, vol_heston, seed=seed)  # FIX: Pass seed
+        metrics = calculate_metrics(params, btc_prices, vol_heston, seed=seed)
         resp = {
             'metrics': metrics,
             'snapshot_id': snapshot_id,
@@ -765,41 +737,33 @@ def reproduce_run(request):
 @csrf_exempt
 def get_audit_trail(request):
     try:
-        # Get all snapshots ordered by timestamp (newest first)
         snapshots = Snapshot.objects.all().order_by('-timestamp')
-        
         audit_entries = []
         
         for snapshot in snapshots:
-            # Create a comprehensive audit entry for each snapshot
             entry = {
                 'timestamp': snapshot.timestamp.isoformat(),
                 'user': snapshot.user,
                 'snapshot_id': snapshot.id,
                 'mode': snapshot.mode,
-                'action': 'calculate',  # Default action
+                'action': 'calculate',
                 'code_hash': hashlib.sha256(snapshot.params_json.encode()).hexdigest()[:16],
-                'seed': 42,  # Default seed used in calculations
+                'seed': 42,
                 'assumptions': json.loads(snapshot.params_json),
-                'changes': []  # Will populate with changes if we can compare with previous
+                'changes': []
             }
-            
             audit_entries.append(entry)
         
-        # If we have multiple snapshots, calculate changes between consecutive ones
         if len(audit_entries) > 1:
             for i in range(len(audit_entries) - 1):
                 current = audit_entries[i]['assumptions']
                 previous = audit_entries[i + 1]['assumptions']
-                
                 changes = []
                 all_keys = set(current.keys()) | set(previous.keys())
                 
                 for key in all_keys:
                     current_val = current.get(key)
                     previous_val = previous.get(key)
-                    
-                    # Check if value changed (handle None cases)
                     if current_val != previous_val:
                         changes.append({
                             'field': key,
@@ -810,7 +774,6 @@ def get_audit_trail(request):
                 audit_entries[i]['changes'] = changes
                 audit_entries[i]['action'] = f'Modified {len(changes)} parameters'
         
-        # For the first entry, set a creation action
         if audit_entries:
             audit_entries[-1]['action'] = 'Initial calculation'
         
