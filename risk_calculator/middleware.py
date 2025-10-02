@@ -1,7 +1,10 @@
+from django.utils import timezone
 from django.http import JsonResponse
 import jwt
 from django.conf import settings
 import logging
+from .models import PasswordAccess
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +28,27 @@ class PasswordProtectionMiddleware:
         try:
             # Decode JWT
             payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=['HS256'])
-            # Optionally, you can attach user info to the request
             request.jwt_payload = payload
+
+            # Check if password is still valid
+            password_id = payload.get('password_id')
+            if not password_id:
+                logger.warning("JWT token missing password_id")
+                return JsonResponse({'error': 'Authentication required: Invalid token format'}, status=401)
+
+            try:
+                password_access = PasswordAccess.objects.get(id=password_id, is_active=True)
+            except PasswordAccess.DoesNotExist:
+                logger.warning(f"Password with ID {password_id} is inactive or does not exist")
+                return JsonResponse({'error': 'Authentication required: Password revoked or inactive'}, status=401)
+
+            # Check if token was issued after the last revocation
+            if password_access.last_revoked_at:
+                token_iat = datetime.fromtimestamp(payload['iat'], tz=timezone.utc)
+                if token_iat < password_access.last_revoked_at:
+                    logger.warning(f"Token issued at {token_iat} is older than last revocation at {password_access.last_revoked_at}")
+                    return JsonResponse({'error': 'Authentication required: Token invalidated due to password revocation'}, status=401)
+
         except jwt.ExpiredSignatureError:
             logger.warning("JWT token expired")
             return JsonResponse({'error': 'Authentication required: Token expired'}, status=401)

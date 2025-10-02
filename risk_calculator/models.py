@@ -19,6 +19,7 @@ class PasswordAccess(models.Model):
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    last_revoked_at = models.DateTimeField(null=True, blank=True)
     description = models.CharField(max_length=255, blank=True, help_text="Optional description for this password")
 
     def __str__(self):
@@ -27,4 +28,3 @@ class PasswordAccess(models.Model):
     class Meta:
         verbose_name = "Access Password"
         verbose_name_plural = "Access Passwords"
-        

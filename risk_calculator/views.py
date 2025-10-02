@@ -78,21 +78,24 @@ def login(request):
             return JsonResponse({'error': 'Password is required'}, status=400)
         
         # Check if password exists and is active
-        if PasswordAccess.objects.filter(password=password, is_active=True).exists():
-            # Generate JWT token
-            payload = {
-                'user': 'anonymous',
-                'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24),
-                'iat': datetime.datetime.now(datetime.timezone.utc)
-            }
-            token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm='HS256')
-            return JsonResponse({'message': 'Login successful', 'token': token}, status=200)
-        else:
+        try:
+            password_access = PasswordAccess.objects.get(password=password, is_active=True)
+        except PasswordAccess.DoesNotExist:
             return JsonResponse({'error': 'Invalid or inactive password'}, status=401)
+
+        # Generate JWT token
+        payload = {
+            'user': 'anonymous',
+            'password_id': password_access.id,  # Include password_id
+            'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24),
+            'iat': datetime.datetime.now(datetime.timezone.utc)
+        }
+        token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm='HS256')
+        return JsonResponse({'message': 'Login successful', 'token': token}, status=200)
     except Exception as e:
         logger.error(f"Login error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
-
+    
 @require_GET
 def get_presets(request):
     return JsonResponse(PRESET_MAPPINGS, status=200)
