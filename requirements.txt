@@ -10,3 +10,4 @@ Requests==2.32.5
 scipy==1.16.2
 sec_api==1.0.32
 tenacity==9.1.2
+PyJWT==2.10.1
