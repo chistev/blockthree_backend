@@ -160,23 +160,38 @@ def fetch_deribit_iv_cached(tenor_days: int) -> float:
 
 def validate_inputs(params):
     errors = []
-    for k in ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice', 'IssuePrice', 'LoanPrincipal']:
+    structure = params.get('structure', '').lower()
+
+    # Modified: Only require LoanPrincipal > 0 for non-PIPE/ATM structures
+    required_positive_keys = ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice', 'IssuePrice']
+    if structure not in ['pipe', 'atm']:
+        required_positive_keys.append('LoanPrincipal')
+
+    for k in required_positive_keys:
         if params.get(k, 0) <= 0:
             errors.append(f"{k} must be positive")
+
     if params.get('BTC_purchased', 0) < 0:
         errors.append("BTC_purchased cannot be negative")
+
     if params.get('paths', 0) < 1:
         errors.append("paths must be at least 1")
+
     if params.get('long_run_volatility', 0) == 0:
         errors.append("long_run_volatility cannot be zero")
+
     if params.get('shares_basic', 0) <= 0 or params.get('shares_fd', 0) < params.get('shares_basic', 0):
         errors.append("Invalid shares_basic or shares_fd")
+
     if params.get('opex_monthly', 0) <= 0:
         errors.append("opex_monthly must be positive")
+
     if not (0 <= params.get('tax_rate', 0) <= 1):
         errors.append("tax_rate must be between 0 and 1")
+
     if params.get('max_dilution', 0) <= 0 or params.get('max_breach_prob', 0) <= 0 or params.get('min_runway_months', 0) <= 0:
         errors.append("Optimizer constraints must be positive")
+
     if errors:
         raise ValueError("; ".join(errors))
 
