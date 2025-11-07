@@ -48,9 +48,10 @@ DEFAULT_PARAMS = {
     'manual_iv': 0.55,
     'objective_preset': 'balanced',
     'cvar_on': True,
-    'max_dilution': 0.15,
-    'min_runway_months': 12,
-    'max_breach_prob': 0.10,
+    'max_dilution': 0.25,
+    'min_runway_months': 6,
+    'max_breach_prob': 0.25,
     'use_variance_reduction': True,
-    'bootstrap_samples': 100
+    'bootstrap_samples': 100,
+    'opex_stress_volatility': 0.35,
 }

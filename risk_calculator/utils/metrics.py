@@ -158,22 +158,28 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     N, T = btc_prices.shape
     if N == 0 or T == 0:
         raise ValueError("btc_prices must be a non-empty (N, T) array")
-    # Inputs
+
+    # === INPUTS ===
     total_btc = float(params["BTC_treasury"] + params.get("BTC_purchased", 0.0))
     initial_cash = float(params.get("initial_cash", 0.0) + params.get("proceeds", params.get("new_equity_raised", 0.0)))
-    monthly_burn = float(params["opex_monthly"])
+    base_monthly_burn = float(params["opex_monthly"])
     capex_sched = np.array(params.get("capex_schedule", [0.0] * int(T)), dtype=float)
     if capex_sched.size < T:
         capex_sched = np.pad(capex_sched, (0, T - capex_sched.size), constant_values=0.0)
+
     h0 = float(params["haircut_h0"])
     alpha = float(params["haircut_alpha"])
     ltv_cap = float(params["LTV_Cap"])
     liq_penalty = float(params["liquidation_penalty_bps"]) / 10000.0
+
     if params.get("deribit_iv_source", "manual") == "live":
         iv = _fetch_deribit_iv_cached(int(params.get("hedge_tenor_days", 90)), float(params.get("manual_iv", 0.55)))
     else:
         iv = float(params.get("manual_iv", 0.55))
+
     tau_step = float(params.get("t", 1.0)) / max(T, 1)
+
+    # === STATE ARRAYS ===
     cash = np.zeros((N, T), dtype=float)
     cash[:, 0] = initial_cash
     nav = np.zeros((N, T), dtype=float)
@@ -186,16 +192,38 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     other_assets = 0.0
     other_liabs = 0.0
     nols_remaining = np.full(N, float(params.get("nols", 0.0)), dtype=float)
+
+    # === STRESSED BURN RATE (FIXED BUG) ===
+    opex_stress_vol = float(params.get("opex_stress_volatility", 0.35))  # 35% lognormal vol
+    btc_current = float(params["BTC_current_market_price"])
+    btc_relative = btc_prices / btc_current
+
+    # Define market regimes
+    bear_market = btc_relative < 0.7   # BTC down >30%
+    bull_market = btc_relative > 1.3   # BTC up >30%
+
+    # Simulate burn: base + random shock + macro stress
+    random_shock = np.exp(rng.normal(0, opex_stress_vol, size=(N, T)))
+    stress_multiplier = np.where(bear_market, 1.6, np.where(bull_market, 0.9, 1.0))
+    stressed_burn = base_monthly_burn * random_shock * stress_multiplier
+
+    # Hard caps to prevent explosion
+    stressed_burn = np.clip(stressed_burn, base_monthly_burn * 0.5, base_monthly_burn * 3.0)
+
+    # === SIMULATION LOOP ===
     for t_idx in range(1, T):
         S_t = btc_prices[:, t_idx]
         v_btc = total_btc * S_t
         vol_t = vol_heston[:, min(t_idx - 1, vol_heston.shape[1] - 1)]
         haircut_t = np.clip(h0 + alpha * vol_t, 0.05, 0.30)
         collateral = v_btc * (1.0 - haircut_t)
+
         with np.errstate(divide="ignore", invalid="ignore"):
             ltv_t = np.where(collateral > 0, loan_prin / collateral, np.inf)
+
         if t_idx == T - 1:
             ltv_term[...] = ltv_t
+
         breaches = ltv_t > ltv_cap
         breach_counts += breaches.astype(float)
         idxs = np.where(breaches)[0]
@@ -206,10 +234,12 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             liq_amt[success_mask] = excess[success_mask]
             cash[idxs, t_idx] -= liq_amt * (1.0 + liq_penalty)
             cure_success[idxs] += success_mask.astype(float)
+
         interest = loan_prin * cost_of_debt / 12.0
         capex = capex_sched[t_idx] if t_idx < capex_sched.size else 0.0
         hedge_cost = 0.0
         hedge_gain = 0.0
+
         if params.get("hedge_policy", "none") == "protective_put":
             hedge_frac = float(params.get("hedge_intensity", 0.0))
             if hedge_frac > 0:
@@ -228,28 +258,38 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
                 payoff = np.maximum(K - S_next, 0.0)
                 hedge_gain = hedge_frac * payoff * total_btc
             hedge_pnl[:, t_idx] = hedge_gain - hedge_cost
-        cash_delta = -monthly_burn - capex - interest - hedge_cost + hedge_gain
+
+        # === USE STRESSED BURN HERE ===
+        burn_today = stressed_burn[:, t_idx] if t_idx < T else base_monthly_burn
+        cash_delta = -burn_today - capex - interest - hedge_cost + hedge_gain
         cash[:, t_idx] = cash[:, t_idx - 1] + cash_delta
+
         taxable = np.maximum(0.0, hedge_gain - nols_remaining)
         tax = taxable * float(params["tax_rate"])
         cash[:, t_idx] -= tax
         nols_remaining = np.maximum(0.0, nols_remaining - hedge_gain)
+
         nav[:, t_idx] = cash[:, t_idx] + v_btc + other_assets - (loan_prin + other_liabs)
+
+    # === RUNWAY (NOW STRESS-AWARE) ===
     runway = np.full(N, T, dtype=float)
     for i in range(N):
         neg = np.where(cash[i] < 0.0)[0]
         if neg.size:
             runway[i] = float(neg[0])
+
     nav_T = nav[:, -1]
     avg_nav = float(np.mean(nav_T))
     logger.info(f"Terminal NAV: avg_nav={avg_nav:.2f}, min_nav={np.min(nav_T):.2f}, max_nav={np.max(nav_T):.2f}")
     ci_nav = float(1.96 * np.std(nav_T, ddof=1) / np.sqrt(max(N, 1)))
     erosion_prob = float(np.mean(nav_T < 0.9 * avg_nav)) if avg_nav != 0 else 0.0
+
     cvar_val = None
     if params.get("cvar_on", True):
         q = np.percentile(nav_T, 5.0)
         tail = nav_T[nav_T <= q]
         cvar_val = float(np.mean(tail)) if tail.size else float(q)
+
     bs_samples = int(params.get("bootstrap_samples", 1000))
     bs_eros = []
     if bs_samples > 0:
@@ -259,25 +299,21 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             bs_eros.append(np.mean(res < 0.9 * mu) if mu != 0 else 0.0)
     ci_eros_lo = float(np.percentile(bs_eros, 2.5)) if bs_eros else erosion_prob
     ci_eros_hi = float(np.percentile(bs_eros, 97.5)) if bs_eros else erosion_prob
+
     base_dilution = float(params["new_equity_raised"]) / float(params["initial_equity_value"] + params["new_equity_raised"])
     dil_paths = np.array([
         base_dilution * (1.0 + params["dilution_vol_estimate"] * rng.normal())
         for _ in range(N)
     ], dtype=float)
+
     if params.get("structure") == "Convertible":
         S_term = float(np.mean(btc_prices[:, -1]))
         vol_term = float(max(np.mean(vol_heston[:, -1]), 1e-6))
         conversion_price = params["IssuePrice"] * (1 + params.get("premium", 0.0))
         conv_val = tsiveriotis_fernandes_convertible(
-            S_term,
-            conversion_price,
-            float(params["risk_free_rate"]),
-            float(params.get("delta", 0.0)),
-            vol_term,
-            float(params["t"]),
-            float(params["LoanPrincipal"]),
-            float(params["cost_of_debt"]),
-            credit_spread=0.02
+            S_term, conversion_price, float(params["risk_free_rate"]),
+            float(params.get("delta", 0.0)), vol_term, float(params["t"]),
+            float(params["LoanPrincipal"]), float(params["cost_of_debt"]), credit_spread=0.02
         )
         conversion_ratio = params["LoanPrincipal"] / conversion_price if conversion_price > 0 else 0.0
         dil_paths = np.full(
@@ -285,6 +321,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             conversion_ratio / (float(params["shares_fd"]) + conversion_ratio) if (float(params["shares_fd"]) + conversion_ratio) > 0 else 0.0,
             dtype=float
         )
+
     with np.errstate(divide="ignore", invalid="ignore"):
         ltv_terminal = np.where(
             total_btc * btc_prices[:, -1] > 0,
@@ -294,6 +331,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     avg_ltv = float(np.mean(ltv_terminal))
     ci_ltv = float(1.96 * np.std(ltv_terminal, ddof=1) / np.sqrt(max(N, 1)))
     exceed_prob = float(np.mean(ltv_terminal > ltv_cap))
+
     rf = float(params["risk_free_rate"])
     beta = float(params["beta_ROE"])
     exp_btc = float(params["expected_return_btc"])
@@ -303,6 +341,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     avg_roe = float(np.mean(roe))
     ci_roe = 0.0
     sharpe = float((avg_roe - rf) / (np.std([roe], ddof=1) if False else max(1e-9, 0.01)))
+
     scenarios = {
         "Bull Case": {"price_multiplier": 1.5, "probability": 0.25},
         "Base Case": {"price_multiplier": 1.0, "probability": 0.40},
@@ -320,6 +359,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             "ltv_ratio": float(loan_prin / (total_btc * price) if total_btc > 0 else np.inf),
             "probability": float(cfg["probability"]),
         }
+
     final_btc = btc_prices[:, -1]
     distribution_metrics = {
         "bull_market_prob": float(np.mean(final_btc >= params["BTC_current_market_price"] * 1.5)),
@@ -348,12 +388,14 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             },
         },
     }
+
     profit_margin = float((cost_of_debt - rf) / cost_of_debt) if cost_of_debt > 0 else 0.0
     logger.info(f"Calculating profit_margin: cost_of_debt={cost_of_debt}, rf={rf}, profit_margin={profit_margin}")
     roe_uplift = float(avg_roe - exp_btc)
     base_dil_dollars = base_dilution * float(params["initial_equity_value"])
     realized_dil_dollars = float(np.mean(dil_paths)) * float(params["initial_equity_value"])
     savings = float(base_dil_dollars - realized_dil_dollars)
+
     term_sheet = {
         "structure": params.get("structure", "Loan"),
         "amount": loan_prin,
@@ -368,6 +410,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         "roe_uplift": roe_uplift * 100.0,
         "profit_margin": profit_margin,
     }
+
     business_impact = {
         "btc_could_buy": float(loan_prin / params["BTC_current_market_price"] if params["BTC_current_market_price"] > 0 else 0.0),
         "savings": savings,
@@ -376,12 +419,14 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         "reduced_risk": erosion_prob,
         "profit_margin": profit_margin,
     }
+
     runway_stats = {
         "dist_mean": float(np.mean(runway)),
         "p50": float(np.median(runway)),
         "p95": float(np.percentile(runway, 95)),
-        "annual_burn_rate": float(params.get("annual_burn_rate", monthly_burn * 12.0)),
+        "annual_burn_rate": float(params.get("annual_burn_rate", base_monthly_burn * 12.0)),
     }
+
     result = {
         "nav": {
             "avg_nav": avg_nav,
@@ -425,6 +470,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         "cure_success_rate": float(np.mean(np.divide(cure_success, np.maximum(1.0, breach_counts)))),
         "hedge_pnl_avg": float(np.mean(hedge_pnl)),
     }
+
     logger.info(
         "Metrics: NAV=%.2f, LTV>cap=%.4f, Runway(mean)=%.1f, Dil(avg)=%.4f, ROE=%.4f",
         avg_nav, exceed_prob, runway_stats["dist_mean"], result["dilution"]["avg_dilution"], avg_roe
