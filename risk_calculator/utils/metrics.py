@@ -17,7 +17,7 @@ def _bs_put_price(S, K, r, q, sigma, tau):
     if tau <= 0 or sigma <= 0:
         return max(K - S, 0.0)
     sqrt_tau = np.sqrt(tau)
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma * sigma) * tau) / (sigma * sqrt_tau)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma * sigma) * tau) / (sigma * sqrt_tau + 1e-9)
     d2 = d1 - sigma * sqrt_tau
     return float(K * np.exp(-r * tau) * norm.cdf(-d2) - S * np.exp(-q * tau) * norm.cdf(-d1))
 
@@ -43,7 +43,7 @@ def tsiveriotis_fernandes_convertible(
     d = 1.0 / u
     disc_r = np.exp(-r * dt)
     disc_rs = np.exp(-(r + credit_spread) * dt)
-    p = (np.exp((r - q) * dt) - d) / (u - d)
+    p = (np.exp((r - q) * dt) - d) / (u - d + 1e-9)
     p = np.clip(p, 0.0, 1.0)
     bond = np.zeros((steps + 1, steps + 1))
     eqty = np.zeros((steps + 1, steps + 1))
@@ -67,42 +67,9 @@ def almgren_chriss_slippage(Q: float, ADV: float, H: float, eta: float = 0.10, l
     """
     if ADV <= 0:
         return 0.0
-    permanent = eta * (Q / ADV)
+    permanent = eta * (Q / (ADV + 1e-9))
     temporary = lambda_param * sigma * np.sqrt(max(H, 0.0))
     return float(max(permanent + temporary, 0.0))
-
-def _fetch_deribit_iv_cached(tenor_days: int, manual_iv: float) -> float:
-    """
-    Fetch IV from Deribit and cache for 24h. Falls back to manual_iv.
-    """
-    try:
-        import requests
-        key = f"deribit_iv_{tenor_days}"
-        if cache is not None:
-            cached = cache.get(key)
-            if cached:
-                return float(cached)
-        url = (
-            "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
-            "?currency=BTC&kind=option"
-        )
-        data = requests.get(url, timeout=6).json()
-        rows = data.get("result", []) or []
-        ivs = []
-        tenor_token = str(int(tenor_days))
-        for row in rows:
-            name = row.get("instrument_name", "")
-            iv = row.get("implied_volatility")
-            if iv is not None and "P" in name and tenor_token in name:
-                ivs.append(float(iv))
-        if ivs:
-            iv = float(np.mean(ivs))
-            if cache is not None:
-                cache.set(key, iv, timeout=24 * 3600)
-            return iv
-    except Exception as e:  # pragma: no cover
-        logger.warning(f"Deribit IV fetch failed, using manual_iv. Reason: {e}")
-    return float(manual_iv)
 
 # ------------------------- Core Public API ---------------------------------- #
 
@@ -116,15 +83,20 @@ def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_pr
     cpar = candidate.get("params", {})
     # Map candidate parameters
     from risk_calculator.config import DEFAULT_PARAMS
-    tmp['LoanPrincipal'] = cpar.get('amount', tmp.get('LoanPrincipal', DEFAULT_PARAMS['LoanPrincipal']))
+    tmp['LoanPrincipal'] = cpar.get('amount', tmp.get('LoanPrincipal', DEFAULT_PARAMS['LoanPrincipal'])) if tmp.get('structure') in ['Loan', 'Convertible'] else 0.0
+    tmp['new_equity_raised'] = cpar.get('amount', tmp.get('new_equity_raised', DEFAULT_PARAMS['new_equity_raised'])) if tmp.get('structure') in ['PIPE', 'ATM'] else 0.0
     tmp['cost_of_debt'] = cpar.get('rate', tmp.get('cost_of_debt', DEFAULT_PARAMS['cost_of_debt']))
+    tmp['pipe_discount'] = cpar.get('rate', tmp.get('pipe_discount', DEFAULT_PARAMS['pipe_discount'])) if tmp.get('structure') in ['PIPE', 'ATM'] else 0.0
     tmp['LTV_Cap'] = cpar.get('ltv_cap', tmp.get('LTV_Cap', DEFAULT_PARAMS['LTV_Cap']))
     tmp['hedge_intensity'] = cpar.get('hedge_intensity', tmp.get('hedge_intensity', 0.0))
     tmp['premium'] = cpar.get('premium', tmp.get('premium', 0.3))
     if ctype in ("Defensive", "Balanced", "Growth"):
         ctype = cpar.get("structure", ctype)
     slippage = 0.0
-    if ctype == "ATM":
+    if '+' in ctype:  # Hybrid
+        # For hybrid, assume blended proceeds
+        tmp['proceeds'] = tmp.get('LoanPrincipal', 0) + tmp.get('new_equity_raised', 0)
+    elif ctype == "ATM":
         tmp["capacity"] = params["atm_pct_adv"] * params["adv_30d"]
         Q = tmp["capacity"]
         H = params.get("t", 1.0) * 12.0
@@ -153,6 +125,7 @@ def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_pr
 def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray, seed: int = 42) -> Dict[str, Any]:
     """
     Path-wise treasury analytics over simulated BTC paths.
+    Robust to zeros/inactive features.
     """
     rng = np.random.default_rng(seed)
     N, T = btc_prices.shape
@@ -160,8 +133,14 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         raise ValueError("btc_prices must be a non-empty (N, T) array")
 
     # === INPUTS ===
+    structure = params.get('structure', 'Loan')
+    is_hybrid = '+' in structure
+    loan_prin = float(params.get('LoanPrincipal', 0.0))
+    eq_raised = float(params.get('new_equity_raised', 0.0))
+    has_loan = loan_prin > 0 or 'Loan' in structure or 'Convertible' in structure
+    has_equity = eq_raised > 0 or 'PIPE' in structure or 'ATM' in structure
     total_btc = float(params["BTC_treasury"] + params.get("BTC_purchased", 0.0))
-    initial_cash = float(params.get("initial_cash", 0.0) + params.get("proceeds", params.get("new_equity_raised", 0.0)))
+    initial_cash = float(params.get("initial_cash", 0.0) + params.get("proceeds", eq_raised))
     base_monthly_burn = float(params["opex_monthly"])
     capex_sched = np.array(params.get("capex_schedule", [0.0] * int(T)), dtype=float)
     if capex_sched.size < T:
@@ -169,13 +148,10 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
 
     h0 = float(params["haircut_h0"])
     alpha = float(params["haircut_alpha"])
-    ltv_cap = float(params["LTV_Cap"])
+    ltv_cap = float(params["LTV_Cap"]) if has_loan else 0.0
     liq_penalty = float(params["liquidation_penalty_bps"]) / 10000.0
 
-    if params.get("deribit_iv_source", "manual") == "live":
-        iv = _fetch_deribit_iv_cached(int(params.get("hedge_tenor_days", 90)), float(params.get("manual_iv", 0.55)))
-    else:
-        iv = float(params.get("manual_iv", 0.55))
+    iv = float(params.get("manual_iv", 0.55))  # No live fetch
 
     tau_step = float(params.get("t", 1.0)) / max(T, 1)
 
@@ -187,27 +163,22 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     hedge_pnl = np.zeros((N, T), dtype=float)
     breach_counts = np.zeros(N, dtype=float)
     cure_success = np.zeros(N, dtype=float)
-    loan_prin = float(params["LoanPrincipal"])
-    cost_of_debt = float(params["cost_of_debt"])
+    cost_of_debt = float(params["cost_of_debt"]) if has_loan else 0.0
     other_assets = 0.0
     other_liabs = 0.0
     nols_remaining = np.full(N, float(params.get("nols", 0.0)), dtype=float)
 
-    # === STRESSED BURN RATE (FIXED BUG) ===
-    opex_stress_vol = float(params.get("opex_stress_volatility", 0.35))  # 35% lognormal vol
+    # === STRESSED BURN RATE ===
+    opex_stress_vol = float(params.get("opex_stress_volatility", 0.35))
     btc_current = float(params["BTC_current_market_price"])
-    btc_relative = btc_prices / btc_current
+    btc_relative = btc_prices / max(btc_current, 1e-9)
 
-    # Define market regimes
-    bear_market = btc_relative < 0.7   # BTC down >30%
-    bull_market = btc_relative > 1.3   # BTC up >30%
+    bear_market = btc_relative < 0.7
+    bull_market = btc_relative > 1.3
 
-    # Simulate burn: base + random shock + macro stress
     random_shock = np.exp(rng.normal(0, opex_stress_vol, size=(N, T)))
     stress_multiplier = np.where(bear_market, 1.6, np.where(bull_market, 0.9, 1.0))
     stressed_burn = base_monthly_burn * random_shock * stress_multiplier
-
-    # Hard caps to prevent explosion
     stressed_burn = np.clip(stressed_burn, base_monthly_burn * 0.5, base_monthly_burn * 3.0)
 
     # === SIMULATION LOOP ===
@@ -215,19 +186,19 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         S_t = btc_prices[:, t_idx]
         v_btc = total_btc * S_t
         vol_t = vol_heston[:, min(t_idx - 1, vol_heston.shape[1] - 1)]
-        haircut_t = np.clip(h0 + alpha * vol_t, 0.05, 0.30)
-        collateral = v_btc * (1.0 - haircut_t)
+        haircut_t = np.clip(h0 + alpha * vol_t, 0.05, 0.30) if has_loan else np.zeros_like(vol_t)
+        collateral = v_btc * (1.0 - haircut_t) if has_loan else v_btc
 
         with np.errstate(divide="ignore", invalid="ignore"):
-            ltv_t = np.where(collateral > 0, loan_prin / collateral, np.inf)
+            ltv_t = np.where(collateral > 0, loan_prin / collateral, 0.0) if has_loan else np.zeros(N)
 
         if t_idx == T - 1:
             ltv_term[...] = ltv_t
 
-        breaches = ltv_t > ltv_cap
+        breaches = ltv_t > ltv_cap if has_loan else np.zeros(N, dtype=bool)
         breach_counts += breaches.astype(float)
         idxs = np.where(breaches)[0]
-        if idxs.size:
+        if idxs.size and has_loan:
             excess = (ltv_t[idxs] - ltv_cap) * collateral[idxs]
             success_mask = (rng.random(size=idxs.size) < 0.70)
             liq_amt = np.zeros_like(excess)
@@ -235,31 +206,29 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             cash[idxs, t_idx] -= liq_amt * (1.0 + liq_penalty)
             cure_success[idxs] += success_mask.astype(float)
 
-        interest = loan_prin * cost_of_debt / 12.0
+        interest = loan_prin * cost_of_debt / 12.0 if has_loan else 0.0
         capex = capex_sched[t_idx] if t_idx < capex_sched.size else 0.0
         hedge_cost = 0.0
         hedge_gain = 0.0
 
-        if params.get("hedge_policy", "none") == "protective_put":
+        if params.get("hedge_policy", "none") == "protective_put" and params['hedge_intensity'] > 0:
             hedge_frac = float(params.get("hedge_intensity", 0.0))
-            if hedge_frac > 0:
-                K = S_t * (1.0 - hedge_frac)
-                S_mid = float(np.mean(S_t))
-                put_unit = _bs_put_price(
-                    S_mid,
-                    float(np.mean(K)),
-                    float(params["risk_free_rate"]),
-                    float(params.get("delta", 0.0)),
-                    iv,
-                    tau_step
-                )
-                hedge_cost = hedge_frac * put_unit * total_btc
-                S_next = btc_prices[:, min(t_idx + 1, T - 1)]
-                payoff = np.maximum(K - S_next, 0.0)
-                hedge_gain = hedge_frac * payoff * total_btc
-            hedge_pnl[:, t_idx] = hedge_gain - hedge_cost
+            K = S_t * (1.0 - hedge_frac)
+            S_mid = float(np.mean(S_t))
+            put_unit = _bs_put_price(
+                S_mid,
+                float(np.mean(K)),
+                float(params["risk_free_rate"]),
+                float(params.get("delta", 0.0)),
+                iv,
+                tau_step
+            )
+            hedge_cost = hedge_frac * put_unit * total_btc
+            S_next = btc_prices[:, min(t_idx + 1, T - 1)]
+            payoff = np.maximum(K - S_next, 0.0)
+            hedge_gain = hedge_frac * payoff * total_btc
+        hedge_pnl[:, t_idx] = hedge_gain - hedge_cost
 
-        # === USE STRESSED BURN HERE ===
         burn_today = stressed_burn[:, t_idx] if t_idx < T else base_monthly_burn
         cash_delta = -burn_today - capex - interest - hedge_cost + hedge_gain
         cash[:, t_idx] = cash[:, t_idx - 1] + cash_delta
@@ -271,7 +240,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
 
         nav[:, t_idx] = cash[:, t_idx] + v_btc + other_assets - (loan_prin + other_liabs)
 
-    # === RUNWAY (NOW STRESS-AWARE) ===
+    # === RUNWAY ===
     runway = np.full(N, T, dtype=float)
     for i in range(N):
         neg = np.where(cash[i] < 0.0)[0]
@@ -279,20 +248,20 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             runway[i] = float(neg[0])
 
     nav_T = nav[:, -1]
-    avg_nav = float(np.mean(nav_T))
+    avg_nav = float(np.mean(nav_T)) if nav_T.size else 0.0
     logger.info(f"Terminal NAV: avg_nav={avg_nav:.2f}, min_nav={np.min(nav_T):.2f}, max_nav={np.max(nav_T):.2f}")
-    ci_nav = float(1.96 * np.std(nav_T, ddof=1) / np.sqrt(max(N, 1)))
+    ci_nav = float(1.96 * np.std(nav_T, ddof=1) / np.sqrt(max(N, 1))) if N > 1 else 0.0
     erosion_prob = float(np.mean(nav_T < 0.9 * avg_nav)) if avg_nav != 0 else 0.0
 
     cvar_val = None
-    if params.get("cvar_on", True):
+    if params.get("cvar_on", True) and nav_T.size:
         q = np.percentile(nav_T, 5.0)
         tail = nav_T[nav_T <= q]
         cvar_val = float(np.mean(tail)) if tail.size else float(q)
 
-    bs_samples = int(params.get("bootstrap_samples", 1000))
+    bs_samples = int(params.get("bootstrap_samples", 100))
     bs_eros = []
-    if bs_samples > 0:
+    if bs_samples > 0 and nav_T.size:
         for _ in range(bs_samples):
             res = rng.choice(nav_T, size=N, replace=True)
             mu = np.mean(res)
@@ -300,13 +269,13 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     ci_eros_lo = float(np.percentile(bs_eros, 2.5)) if bs_eros else erosion_prob
     ci_eros_hi = float(np.percentile(bs_eros, 97.5)) if bs_eros else erosion_prob
 
-    base_dilution = float(params["new_equity_raised"]) / float(params["initial_equity_value"] + params["new_equity_raised"])
+    base_dilution = eq_raised / max(float(params["initial_equity_value"] + eq_raised), 1e-9) if has_equity else 0.0
     dil_paths = np.array([
         base_dilution * (1.0 + params["dilution_vol_estimate"] * rng.normal())
         for _ in range(N)
-    ], dtype=float)
+    ], dtype=float) if has_equity else np.zeros(N)
 
-    if params.get("structure") == "Convertible":
+    if structure == "Convertible" or (is_hybrid and 'Convertible' in structure):
         S_term = float(np.mean(btc_prices[:, -1]))
         vol_term = float(max(np.mean(vol_heston[:, -1]), 1e-6))
         conversion_price = params["IssuePrice"] * (1 + params.get("premium", 0.0))
@@ -315,10 +284,10 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             float(params.get("delta", 0.0)), vol_term, float(params["t"]),
             float(params["LoanPrincipal"]), float(params["cost_of_debt"]), credit_spread=0.02
         )
-        conversion_ratio = params["LoanPrincipal"] / conversion_price if conversion_price > 0 else 0.0
+        conversion_ratio = params["LoanPrincipal"] / max(conversion_price, 1e-9) if conversion_price > 0 else 0.0
         dil_paths = np.full(
             N,
-            conversion_ratio / (float(params["shares_fd"]) + conversion_ratio) if (float(params["shares_fd"]) + conversion_ratio) > 0 else 0.0,
+            conversion_ratio / max(float(params["shares_fd"]) + conversion_ratio, 1e-9),
             dtype=float
         )
 
@@ -326,21 +295,24 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         ltv_terminal = np.where(
             total_btc * btc_prices[:, -1] > 0,
             loan_prin / (total_btc * btc_prices[:, -1]),
-            np.inf
-        )
+            0.0
+        ) if has_loan else np.zeros(N)
     avg_ltv = float(np.mean(ltv_terminal))
-    ci_ltv = float(1.96 * np.std(ltv_terminal, ddof=1) / np.sqrt(max(N, 1)))
-    exceed_prob = float(np.mean(ltv_terminal > ltv_cap))
+    ci_ltv = float(1.96 * np.std(ltv_terminal, ddof=1) / np.sqrt(max(N, 1))) if N > 1 else 0.0
+    exceed_prob = float(np.mean(ltv_terminal > ltv_cap)) if has_loan else 0.0
 
     rf = float(params["risk_free_rate"])
     beta = float(params["beta_ROE"])
     exp_btc = float(params["expected_return_btc"])
     roe_base = rf + beta * (exp_btc - rf)
-    leverage = loan_prin / float(params["initial_equity_value"] + params["new_equity_raised"])
+    roe_base = np.clip(roe_base, -3.0, 5.0)  # Clamp
+    leverage = loan_prin / max(float(params["initial_equity_value"] + eq_raised), 1e-9) if has_loan else 0.0
     roe = roe_base * (1.0 + leverage * (1.0 - float(np.mean(dil_paths))))
+    roe = np.clip(roe, -1.0, 10.0)  # Never < -100% unless true insolvency
     avg_roe = float(np.mean(roe))
     ci_roe = 0.0
-    sharpe = float((avg_roe - rf) / (np.std([roe], ddof=1) if False else max(1e-9, 0.01)))
+    sharpe = float((avg_roe - rf) / max(np.std([roe], ddof=1), 1e-9) if False else max(1e-9, 0.01))
+    sharpe = np.clip(sharpe, -3.0, 5.0)  # Clamp for display
 
     scenarios = {
         "Bull Case": {"price_multiplier": 1.5, "probability": 0.25},
@@ -351,12 +323,12 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     scenario_metrics = {}
     for name, cfg in scenarios.items():
         price = params["BTC_current_market_price"] * cfg["price_multiplier"]
-        scenario_nav = (total_btc * price - loan_prin) / float(params["shares_fd"])
-        nav_impact = float(((scenario_nav - avg_nav) / avg_nav * 100.0) if avg_nav != 0 else 0.0)
+        scenario_nav = (total_btc * price - loan_prin) / max(float(params["shares_fd"]), 1e-9)
+        nav_impact = float(((scenario_nav - avg_nav) / max(avg_nav, 1e-9) * 100.0)) if avg_nav != 0 else 0.0
         scenario_metrics[name] = {
             "btc_price": float(price),
             "nav_impact": nav_impact,
-            "ltv_ratio": float(loan_prin / (total_btc * price) if total_btc > 0 else np.inf),
+            "ltv_ratio": float(loan_prin / max(total_btc * price, 1e-9)) if total_btc > 0 else 0.0,
             "probability": float(cfg["probability"]),
         }
 
@@ -389,21 +361,33 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         },
     }
 
-    profit_margin = float((cost_of_debt - rf) / cost_of_debt) if cost_of_debt > 0 else 0.0
+    profit_margin = float((cost_of_debt - rf) / max(cost_of_debt, 1e-9)) if cost_of_debt > 0 else 0.0
     logger.info(f"Calculating profit_margin: cost_of_debt={cost_of_debt}, rf={rf}, profit_margin={profit_margin}")
     roe_uplift = float(avg_roe - exp_btc)
     base_dil_dollars = base_dilution * float(params["initial_equity_value"])
     realized_dil_dollars = float(np.mean(dil_paths)) * float(params["initial_equity_value"])
     savings = float(base_dil_dollars - realized_dil_dollars)
 
+    # WACC
+    E = float(params["initial_equity_value"] + eq_raised)
+    D = loan_prin
+    V = max(E + D, 1e-9)
+    r_e = exp_btc  # Equity cost ~ expected BTC return
+    r_d = cost_of_debt
+    tax_rate = float(params["tax_rate"])
+    # adj_BTC: haircut-adjusted collateral cost ~ avg haircut * r_d
+    avg_haircut = float(np.mean(h0 + alpha * vol_heston)) if vol_heston.size else 0.0
+    adj_BTC = params['kappa_btc'] * avg_haircut * r_d
+    wacc = (E / V) * r_e + (D / V) * r_d * (1 - tax_rate) + adj_BTC
+
     term_sheet = {
-        "structure": params.get("structure", "Loan"),
-        "amount": loan_prin,
+        "structure": structure,
+        "amount": loan_prin + eq_raised,
         "rate": cost_of_debt,
         "term": float(params["t"]),
         "ltv_cap": ltv_cap,
-        "collateral": float(total_btc * np.mean(final_btc)),
-        "conversion_premium": float(params.get("premium", 0.3)) if params.get("structure") == "Convertible" else 0.0,
+        "collateral": float(total_btc * np.mean(final_btc)) if total_btc > 0 else 0.0,
+        "conversion_premium": float(params.get("premium", 0.3)) if 'Convertible' in structure else 0.0,
         "btc_bought": float(params.get("BTC_purchased", 0.0)),
         "total_btc_treasury": float(total_btc),
         "savings": savings,
@@ -412,7 +396,7 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     }
 
     business_impact = {
-        "btc_could_buy": float(loan_prin / params["BTC_current_market_price"] if params["BTC_current_market_price"] > 0 else 0.0),
+        "btc_could_buy": float((loan_prin + eq_raised) / max(params["BTC_current_market_price"], 1e-9)),
         "savings": savings,
         "kept_money": savings,
         "roe_uplift": roe_uplift * 100.0,
@@ -464,15 +448,23 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
             "initial_btc": float(params["BTC_treasury"]),
             "purchased_btc": float(params.get("BTC_purchased", 0.0)),
             "total_btc": float(total_btc),
-            "total_value": float(total_btc * np.mean(final_btc)),
+            "total_value": float(total_btc * np.mean(final_btc)) if final_btc.size else 0.0,
         },
         "runway": runway_stats,
         "cure_success_rate": float(np.mean(np.divide(cure_success, np.maximum(1.0, breach_counts)))),
         "hedge_pnl_avg": float(np.mean(hedge_pnl)),
+        "wacc": float(wacc),
     }
 
+    # Remove NaN/Inf
+    for k, v in result.items():
+        if isinstance(v, dict):
+            for sk, sv in v.items():
+                if isinstance(sv, float) and (np.isnan(sv) or np.isinf(sv)):
+                    v[sk] = 0.0
+
     logger.info(
-        "Metrics: NAV=%.2f, LTV>cap=%.4f, Runway(mean)=%.1f, Dil(avg)=%.4f, ROE=%.4f",
-        avg_nav, exceed_prob, runway_stats["dist_mean"], result["dilution"]["avg_dilution"], avg_roe
+        "Metrics: NAV=%.2f, LTV>cap=%.4f, Runway(mean)=%.1f, Dil(avg)=%.4f, ROE=%.4f, WACC=%.4f",
+        avg_nav, exceed_prob, runway_stats["dist_mean"], result["dilution"]["avg_dilution"], avg_roe, wacc
     )
     return result

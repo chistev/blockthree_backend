@@ -15,8 +15,6 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 import logging
-import pdfplumber
-import pandas as pd
 import re
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 import hashlib
@@ -31,7 +29,7 @@ import jwt
 import datetime
 import traceback
 
-# Configure logging to include stack traces
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
@@ -56,18 +54,6 @@ PRESET_MAPPINGS = {
     }
 }
 
-REGEX_PATTERNS = {
-    'initial_equity_value': re.compile(r"Total\s+Shareholders?\s+Equity\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
-    'LoanPrincipal': re.compile(r"Long[-\s]?Term\s+Debt\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
-    'new_equity_raised': re.compile(r"Capital\s+Stock\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
-    'shares_basic': re.compile(r"Common\s+Stock\s+Shares\s+Outstanding\s+([\d,]+)", re.IGNORECASE),
-    'shares_fd': re.compile(r"Fully\s+Diluted\s+Shares\s+([\d,]+)", re.IGNORECASE),
-    'opex_monthly': re.compile(r"Operating\s+Expenses\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
-    'nols': re.compile(r"Net\s+Operating\s+Loss\s+Carryforward\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
-    'tax_rate': re.compile(r"Effective\s+Tax\s+Rate\s+([\d.]+)%", re.IGNORECASE),
-    'capex': re.compile(r"Capital\s+Expenditures\s+\$?([\d,]+(?:\.\d+)?)", re.IGNORECASE),
-}
-
 @csrf_exempt
 @require_POST
 def login(request):
@@ -77,16 +63,14 @@ def login(request):
         if not password:
             return JsonResponse({'error': 'Password is required'}, status=400)
         
-        # Check if password exists and is active
         try:
             password_access = PasswordAccess.objects.get(password=password, is_active=True)
         except PasswordAccess.DoesNotExist:
             return JsonResponse({'error': 'Invalid or inactive password'}, status=401)
 
-        # Generate JWT token
         payload = {
             'user': 'anonymous',
-            'password_id': password_access.id,  # Include password_id
+            'password_id': password_access.id,
             'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24),
             'iat': datetime.datetime.now(datetime.timezone.utc)
         }
@@ -120,49 +104,14 @@ def fetch_btc_price_cached():
         cache.set(cache_key, price, timeout=300)
         logger.info(f"Fetched and cached BTC price: {price}")
         return price
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error fetching BTC price: {e}\n{traceback.format_exc()}")
-        return None
-    except (KeyError, ValueError) as e:
-        logger.error(f"Data parsing error fetching BTC price: {e}\n{traceback.format_exc()}")
-        return None
     except Exception as e:
-        logger.error(f"Unexpected error fetching BTC price: {e}\n{traceback.format_exc()}")
+        logger.error(f"BTC price fetch error: {e}\n{traceback.format_exc()}")
         return None
-
-@lru_cache(maxsize=128)
-def fetch_deribit_iv_cached(tenor_days: int) -> float:
-    try:
-        cache_key = f'deribit_iv_{tenor_days}'
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-        r = requests.get(
-            'https://www.deribit.com/api/v2/public/get_book_summary_by_currency',
-            params={'currency': 'BTC', 'kind': 'option'},
-            timeout=3
-        )
-        r.raise_for_status()
-        data = r.json().get('result', []) or []
-        vols = []
-        tenor_token = str(int(tenor_days))
-        for opt in data:
-            name = opt.get('instrument_name', '')
-            iv = opt.get('implied_volatility')
-            if iv and 'P' in name and tenor_token in name:
-                vols.append(iv)
-        iv_ret = float(np.mean(vols)) if vols else DEFAULT_PARAMS['manual_iv']
-        cache.set(cache_key, iv_ret, timeout=24*3600)
-        return iv_ret
-    except Exception as e:
-        logger.error(f"Deribit IV fetch failed: {e}\n{traceback.format_exc()}")
-        return DEFAULT_PARAMS['manual_iv']
 
 def validate_inputs(params):
     errors = []
     structure = params.get('structure', '').lower()
 
-    # Modified: Only require LoanPrincipal > 0 for non-PIPE/ATM structures
     required_positive_keys = ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice', 'IssuePrice']
     if structure not in ['pipe', 'atm']:
         required_positive_keys.append('LoanPrincipal')
@@ -173,199 +122,21 @@ def validate_inputs(params):
 
     if params.get('BTC_purchased', 0) < 0:
         errors.append("BTC_purchased cannot be negative")
-
     if params.get('paths', 0) < 1:
         errors.append("paths must be at least 1")
-
     if params.get('long_run_volatility', 0) == 0:
         errors.append("long_run_volatility cannot be zero")
-
     if params.get('shares_basic', 0) <= 0 or params.get('shares_fd', 0) < params.get('shares_basic', 0):
         errors.append("Invalid shares_basic or shares_fd")
-
     if params.get('opex_monthly', 0) <= 0:
         errors.append("opex_monthly must be positive")
-
     if not (0 <= params.get('tax_rate', 0) <= 1):
         errors.append("tax_rate must be between 0 and 1")
-
     if params.get('max_dilution', 0) <= 0 or params.get('max_breach_prob', 0) <= 0 or params.get('min_runway_months', 0) <= 0:
         errors.append("Optimizer constraints must be positive")
 
     if errors:
         raise ValueError("; ".join(errors))
-
-def fetch_sec_data(ticker):
-    try:
-        cache_key = f'sec_data_{ticker}'
-        cached = cache.get(cache_key)
-        if cached is not None:
-            logger.info(f"Returning cached SEC data for {ticker}: {cached}")
-            return cached
-
-        api_key = settings.ALPHA_VANTAGE_API_KEY
-        if not api_key:
-            raise ValueError("Alpha Vantage API key is invalid or missing. Check your .env file.")
-
-        @retry(
-            stop=stop_after_attempt(5),  # Increased retries
-            wait=wait_exponential(multiplier=1, min=4, max=20),  # Increased max wait
-            retry=retry_if_exception_type(requests.exceptions.RequestException),
-            before_sleep=lambda retry_state: logger.warning(
-                f"Retrying Alpha Vantage API call for {ticker} (attempt {retry_state.attempt_number})..."
-            )
-        )
-        def make_api_call():
-            url = f"https://www.alphavantage.co/query?function=BALANCE_SHEET&symbol={ticker}&apikey={api_key}"
-            response = requests.get(url, timeout=20)  # Increased timeout
-            response.raise_for_status()
-            return response.json()
-
-        data = make_api_call()
-        if 'annualReports' not in data:
-            if 'Information' in data and 'API rate limit' in data['Information']:
-                raise ValueError("Alpha Vantage API rate limit exceeded. Please try again later.")
-            raise ValueError(f"No balance sheet data found for ticker {ticker}")
-
-        latest_report = data['annualReports'][0]
-
-        def safe_float(value, default=0.0):
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return default
-
-        total_equity = safe_float(latest_report.get('totalShareholderEquity'))
-        total_debt = safe_float(latest_report.get('longTermDebt'))
-        new_equity_raised = safe_float(latest_report.get('capitalStock'))
-
-        result = {
-            'initial_equity_value': total_equity if total_equity > 0 else DEFAULT_PARAMS['initial_equity_value'],
-            'LoanPrincipal': total_debt if total_debt > 0 else DEFAULT_PARAMS['LoanPrincipal'],
-            'new_equity_raised': new_equity_raised if new_equity_raised > 0 else DEFAULT_PARAMS['new_equity_raised'],
-        }
-
-        cache.set(cache_key, result, timeout=24*3600)  # Cache for 24 hours
-        logger.info(f"Fetched and cached Alpha Vantage data for {ticker}: {result}")
-        return result
-
-    except requests.exceptions.ConnectionError as e:
-        if "NameResolutionError" in str(e):
-            logger.error(f"DNS resolution failed for Alpha Vantage API: {e}\n{traceback.format_exc()}")
-            return {
-                'error': f"DNS resolution failed for ticker {ticker}. Using default values.",
-                'initial_equity_value': DEFAULT_PARAMS['initial_equity_value'],
-                'LoanPrincipal': DEFAULT_PARAMS['LoanPrincipal'],
-                'new_equity_raised': DEFAULT_PARAMS['new_equity_raised'],
-            }
-        logger.error(f"Network error fetching Alpha Vantage data for {ticker}: {e}\n{traceback.format_exc()}")
-        return {'error': str(e)}
-    except Exception as e:
-        logger.error(f"Failed to fetch Alpha Vantage data for {ticker}: {str(e)}\n{traceback.format_exc()}")
-        return {'error': str(e)}
-
-def parse_sec_file(file, ticker):
-    try:
-        result = {k: DEFAULT_PARAMS[k] for k in [
-            'initial_equity_value', 'LoanPrincipal', 'new_equity_raised',
-            'shares_basic', 'shares_fd', 'opex_monthly', 'nols', 'tax_rate', 'capex_schedule'
-        ]}
-        ext = file.name.split('.')[-1].lower()
-        if ext not in ['pdf', 'xlsx', 'csv']:
-            raise ValueError(f"Unsupported file format: {ext}")
-        
-        if ext == 'pdf':
-            with pdfplumber.open(file) as pdf:
-                for page in pdf.pages:
-                    txt = page.extract_text() or ''
-                    for key, pat in REGEX_PATTERNS.items():
-                        if key == 'capex':
-                            continue
-                        m = pat.search(txt)
-                        if m:
-                            raw = float(m.group(1).replace(',', ''))
-                            val = raw/12.0 if key == 'opex_monthly' else raw
-                            result[key] = val
-                            result[f'{key}_source'] = 'Uploaded File'
-                    m_capex = REGEX_PATTERNS['capex'].search(txt)
-                    if m_capex:
-                        capex_month = float(m_capex.group(1).replace(',', ''))/12.0
-                        result['capex_schedule'] = [capex_month]*12
-                        result['capex_schedule_source'] = 'Uploaded File'
-                    else:
-                        result['capex_schedule'] = [0.0]*12
-                        result['capex_schedule_source'] = 'Default'
-        else:
-            if ext == 'xlsx':
-                df = pd.read_excel(file)
-            else:
-                df = pd.read_csv(file)
-            
-            logger.info(f"File columns: {df.columns.tolist()}")
-            logger.info(f"File shape: {df.shape}")
-            logger.info(f"First few rows:\n{df.head()}")
-            
-            if len(df.columns) == 2 and 'Metric' in df.columns and 'Value' in df.columns:
-                metric_dict = dict(zip(df['Metric'], df['Value']))
-                logger.info(f"Extracted metrics: {metric_dict}")
-                
-                mapping = {
-                    'Total Shareholder Equity': 'initial_equity_value',
-                    'Long-Term Debt': 'LoanPrincipal', 
-                    'Capital Stock': 'new_equity_raised',
-                    'Common Stock Shares Outstanding': 'shares_basic',
-                    'Fully Diluted Shares': 'shares_fd',
-                    'Operating Expenses': 'opex_monthly',
-                    'Net Operating Loss': 'nols',
-                    'Effective Tax Rate': 'tax_rate',
-                    'Capital Expenditures': 'capex_schedule'
-                }
-                
-                for metric_name, param_name in mapping.items():
-                    if metric_name in metric_dict:
-                        value = metric_dict[metric_name]
-                        if 'Tax Rate' in metric_name and isinstance(value, str) and '%' in value:
-                            value = float(value.replace('%', '')) / 100.0
-                        elif isinstance(value, str):
-                            value = float(value.replace(',', ''))
-                        
-                        if param_name == 'opex_monthly':
-                            if value > 1000000:
-                                value = value / 12.0
-                        
-                        result[param_name] = value
-                        result[f'{param_name}_source'] = 'Uploaded File'
-                        logger.info(f"Mapped {metric_name} -> {param_name} = {value}")
-            
-            else:
-                target_cols = {
-                    'initial_equity_value': ['Total Shareholder Equity', 'Shareholder Equity', 'Total Equity'],
-                    'LoanPrincipal': ['Long-Term Debt', 'Total Debt', 'Debt'],
-                    'new_equity_raised': ['Capital Stock', 'Common Stock'],
-                    'shares_basic': ['Common Stock Shares Outstanding', 'Shares Outstanding'],
-                    'shares_fd': ['Fully Diluted Shares', 'FD Shares'],
-                    'opex_monthly': ['Operating Expenses', 'Opex'],
-                    'nols': ['Net Operating Loss', 'NOL'],
-                    'tax_rate': ['Tax Rate', 'Effective Tax Rate'],
-                }
-                
-                for key, synonyms in target_cols.items():
-                    for col in df.columns:
-                        if any(SequenceMatcher(None, col.lower(), s.lower()).ratio() > 0.8 for s in synonyms):
-                            v = float(df[col].iloc[0])
-                            result[key] = v/12.0 if key == 'opex_monthly' else v
-                            result[f'{key}_source'] = 'Uploaded File'
-                            break
-            
-            result['capex_schedule'] = [0.0]*12
-            result['capex_schedule_source'] = 'Default'
-        
-        logger.info(f"Final parsed result: {result}")
-        return result
-        
-    except Exception as e:
-        logger.error(f"Failed to parse SEC file: {e}\n{traceback.format_exc()}")
-        return {'error': f"Failed to parse {ext.upper()} file: {e}"}
 
 @csrf_exempt
 def get_default_params(request):
@@ -378,41 +149,6 @@ def get_default_params(request):
     except Exception as e:
         logger.error(f"Get default params error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=500)
-
-@csrf_exempt
-@require_POST
-def fetch_sec_data_endpoint(request):
-    try:
-        data = get_json_data(request)
-        ticker = data.get('ticker')
-        if not ticker:
-            return JsonResponse({'error': 'Ticker symbol is required'}, status=400)
-        out = fetch_sec_data(ticker)
-        if 'error' in out:
-            return JsonResponse({'error': out['error']}, status=400)
-        return JsonResponse(out)
-    except Exception as e:
-        logger.error(f"Fetch SEC data endpoint error: {e}\n{traceback.format_exc()}")
-        return JsonResponse({'error': str(e)}, status=400)
-
-@csrf_exempt
-@require_POST
-def upload_sec_data(request):
-    try:
-        ticker = request.POST.get('ticker', '')
-        file = request.FILES.get('file')
-        if not file:
-            return JsonResponse({'error': 'No file uploaded'}, status=400)
-        max_size = settings.DATA_UPLOAD_MAX_MEMORY_SIZE
-        if file.size > max_size:
-            return JsonResponse({'error': f'File size exceeds limit of {max_size / (1024 * 1024)}MB'}, status=400)
-        out = parse_sec_file(file, ticker)
-        if 'error' in out:
-            return JsonResponse({'error': out['error']}, status=400)
-        return JsonResponse(out)
-    except Exception as e:
-        logger.error(f"Upload SEC data endpoint error: {e}\n{traceback.format_exc()}")
-        return JsonResponse({'error': f"Failed to process file: {e}"}, status=400)
 
 @csrf_exempt
 @require_POST
@@ -461,7 +197,7 @@ def generate_csv_response(metrics, candidates):
     headers = [
         'Candidate', 'NAV Mean', 'NAV Erosion Prob', 'Dilution Avg', 'LTV Breach Prob',
         'Runway Months Mean', 'BTC Total', 'Structure', 'Amount', 'Rate', 'BTC Bought',
-        'Savings', 'ROE Uplift', 'Profit Margin'
+        'Savings', 'ROE Uplift', 'Profit Margin', 'WACC'
     ]
     writer.writerow(headers)
     
@@ -489,6 +225,7 @@ def generate_csv_response(metrics, candidates):
             f"{term_sheet.get('savings', 0):.2f}",
             f"{term_sheet.get('roe_uplift', 0):.2f}%",
             f"{term_sheet.get('profit_margin', 0):.4f}",
+            f"{m.get('wacc', 0):.4f}"
         ])
     
     resp = HttpResponse(content_type='text/csv')
@@ -530,6 +267,7 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
             ['Savings', f"${term_sheet.get('savings', 0):.2f}"],
             ['ROE Uplift', f"{term_sheet.get('roe_uplift', 0):.2f}%"],
             ['Profit Margin', f"{term_sheet.get('profit_margin', 0):.2%}"],
+            ['WACC', f"{m.get('wacc', 0):.2%}"],
         ]
         table = Table(data)
         table.setStyle(TableStyle([
@@ -549,11 +287,16 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
     return resp
 
 def run_calculation(data, snapshot_id):
-    params = {}
+    from risk_calculator.config import DEFAULT_PARAMS  # Import here to avoid circular import
+
     try:
         logger.info(f"Running calculation for snapshot {snapshot_id}")
         snapshot = Snapshot.objects.get(id=snapshot_id)
+        
+        # === CRITICAL FIX: MERGE DEFAULTS ===
         params = json.loads(snapshot.params_json)
+        params = {**DEFAULT_PARAMS, **params}  # ← THIS LINE FIXES 'nsga_pop_size' ERROR
+
         params['export_format'] = data.get('format', 'json').lower()
         params['use_live'] = data.get('use_live', False)
         params['mode'] = snapshot.mode
@@ -561,11 +304,10 @@ def run_calculation(data, snapshot_id):
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
         calculation_seed = data.get('seed', 42)
+        obj_switches = data.get('objective_switches', DEFAULT_PARAMS['objective_switches'])
+        params['objective_switches'] = obj_switches
 
-        if params.get('deribit_iv_source') == 'live':
-            params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
-        else:
-            params['option_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
+        params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
 
         validate_inputs(params)
 
@@ -585,7 +327,7 @@ def run_calculation(data, snapshot_id):
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
 
         candidates = optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed=calculation_seed)
-        if not candidates:
+        if not candidates or len(candidates) < 4:
             raise ValueError("Optimization failed to produce candidates")
 
         def evaluate_candidate_wrapper(cand):
@@ -611,25 +353,6 @@ def run_calculation(data, snapshot_id):
         else:
             final_metrics = calculate_metrics(stable_params, btc_prices, vol_heston, seed=calculation_seed)
             cache.set(metrics_cache_key, final_metrics, timeout=3600)
-
-        logger.info("=== CALCULATION RESULTS DEBUG ===")
-        logger.info(f"Final metrics keys: {final_metrics.keys()}")
-        
-        if 'term_sheet' in final_metrics:
-            logger.info(f"Term sheet data: {final_metrics['term_sheet']}")
-            logger.info(f"Profit margin: {final_metrics['term_sheet'].get('profit_margin', 'NOT FOUND')}")
-            logger.info(f"ROE uplift: {final_metrics['term_sheet'].get('roe_uplift', 'NOT FOUND')}")
-            logger.info(f"Savings: {final_metrics['term_sheet'].get('savings', 'NOT FOUND')}")
-        
-        for i, candidate in enumerate(candidate_results):
-            logger.info(f"Candidate {i} ({candidate['type']}):")
-            if 'metrics' in candidate and 'term_sheet' in candidate['metrics']:
-                ts = candidate['metrics']['term_sheet']
-                logger.info(f"  - Profit margin: {ts.get('profit_margin', 'NOT FOUND')}")
-                logger.info(f"  - ROE uplift: {ts.get('roe_uplift', 'NOT FOUND')}")
-                logger.info(f"  - Savings: {ts.get('savings', 'NOT FOUND')}")
-        
-        logger.info("=== END DEBUG ===")
 
         nav_paths = np.array(final_metrics.get('nav', {}).get('nav_paths_preview', []))
         if nav_paths.size > 0:
@@ -675,11 +398,8 @@ def calculate(request):
 @csrf_exempt
 def get_btc_price(request):
     try:
-        # Log request headers for debugging
-        logger.debug(f"Request headers: {dict(request.headers)}")
         p = fetch_btc_price_cached()
         if p is None:
-            logger.error("BTC price is None after fetch attempt")
             return JsonResponse({'error': 'Failed to fetch live BTC price'}, status=500)
         return JsonResponse({'BTC_current_market_price': p})
     except Exception as e:
@@ -698,17 +418,17 @@ def what_if(request):
             return JsonResponse({'error': 'Snapshot ID, param, and value required'}, status=400)
         snapshot = Snapshot.objects.get(id=snapshot_id)
         params = json.loads(snapshot.params_json)
+        params = {**DEFAULT_PARAMS, **params}  # Merge defaults
         params['export_format'] = data.get('format', 'json').lower()
         params['use_live'] = data.get('use_live', False)
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
         calculation_seed = data.get('seed', 42)
+        obj_switches = data.get('objective_switches', DEFAULT_PARAMS['objective_switches'])
+        params['objective_switches'] = obj_switches
 
-        if params.get('deribit_iv_source') == 'live':
-            params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
-        else:
-            params['option_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
+        params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
 
         validate_inputs(params)
 
@@ -728,7 +448,7 @@ def what_if(request):
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
 
         if value in ['optimize', 'maximize'] or param == 'optimize_all':
-            opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, max_candidates=3, seed=calculation_seed)
+            opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed=calculation_seed)
             if opts:
                 balanced = next((c for c in opts if c['type'] == 'Balanced'), opts[0])
                 params.update(balanced['params'])
@@ -755,15 +475,15 @@ def reproduce_run(request):
         seed = int(data.get('seed', 42))
         snapshot = Snapshot.objects.get(id=snapshot_id)
         params = json.loads(snapshot.params_json)
+        params = {**DEFAULT_PARAMS, **params}  # Merge defaults
         params['export_format'] = data.get('format', 'json').lower()
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
+        obj_switches = data.get('objective_switches', DEFAULT_PARAMS['objective_switches'])
+        params['objective_switches'] = obj_switches
 
-        if params.get('deribit_iv_source') == 'live':
-            params['option_iv'] = float(fetch_deribit_iv_cached(int(params.get('hedge_tenor_days', 90))))
-        else:
-            params['option_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
+        params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
 
         cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{seed}"
         cached_simulation = cache.get(cache_key)
