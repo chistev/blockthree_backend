@@ -15,43 +15,20 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 import logging
-import re
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 import hashlib
-from difflib import SequenceMatcher
 from django.core.cache import cache
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
-from risk_calculator.utils.metrics import calculate_metrics, evaluate_candidate
-from risk_calculator.utils.optimization import optimize_for_corporate_treasury
-from risk_calculator.utils.simulation import simulate_btc_paths
 import jwt
 import datetime
 import traceback
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 PRESET_MAPPINGS = {
-    'Defensive': {
-        'LTV_Cap': 0.5,
-        'min_profit_margin': 0.2,
-        'mu': 0.3,
-        'sigma': 0.4
-    },
-    'Balanced': {
-        'LTV_Cap': 0.7,
-        'min_profit_margin': 0.1,
-        'mu': 0.45,
-        'sigma': 0.6
-    },
-    'Growth': {
-        'LTV_Cap': 0.9,
-        'min_profit_margin': 0.05,
-        'mu': 0.6,
-        'sigma': 0.8
-    }
+    'Defensive': {'LTV_Cap': 0.5, 'min_profit_margin': 0.2, 'mu': 0.3, 'sigma': 0.4},
+    'Balanced': {'LTV_Cap': 0.7, 'min_profit_margin': 0.1, 'mu': 0.45, 'sigma': 0.6},
+    'Growth': {'LTV_Cap': 0.9, 'min_profit_margin': 0.05, 'mu': 0.6, 'sigma': 0.8}
 }
 
 @csrf_exempt
@@ -62,12 +39,10 @@ def login(request):
         password = data.get('password')
         if not password:
             return JsonResponse({'error': 'Password is required'}, status=400)
-        
         try:
             password_access = PasswordAccess.objects.get(password=password, is_active=True)
         except PasswordAccess.DoesNotExist:
             return JsonResponse({'error': 'Invalid or inactive password'}, status=401)
-
         payload = {
             'user': 'anonymous',
             'password_id': password_access.id,
@@ -79,7 +54,7 @@ def login(request):
     except Exception as e:
         logger.error(f"Login error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=400)
-    
+
 @require_GET
 def get_presets(request):
     return JsonResponse(PRESET_MAPPINGS, status=200)
@@ -87,7 +62,6 @@ def get_presets(request):
 def get_json_data(request):
     return json.loads(request.body.decode('utf-8'))
 
-@lru_cache(maxsize=128)
 def fetch_btc_price_cached():
     try:
         cache_key = 'btc_price'
@@ -111,15 +85,12 @@ def fetch_btc_price_cached():
 def validate_inputs(params):
     errors = []
     structure = params.get('structure', '').lower()
-
     required_positive_keys = ['initial_equity_value', 'BTC_current_market_price', 'BTC_treasury', 'targetBTCPrice', 'IssuePrice']
     if structure not in ['pipe', 'atm']:
         required_positive_keys.append('LoanPrincipal')
-
     for k in required_positive_keys:
         if params.get(k, 0) <= 0:
             errors.append(f"{k} must be positive")
-
     if params.get('BTC_purchased', 0) < 0:
         errors.append("BTC_purchased cannot be negative")
     if params.get('paths', 0) < 1:
@@ -134,7 +105,6 @@ def validate_inputs(params):
         errors.append("tax_rate must be between 0 and 1")
     if params.get('max_dilution', 0) <= 0 or params.get('max_breach_prob', 0) <= 0 or params.get('min_runway_months', 0) <= 0:
         errors.append("Optimizer constraints must be positive")
-
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -159,9 +129,7 @@ def lock_snapshot(request):
         mode = data.get('mode', 'pro-forma')
         if mode not in ['public', 'private', 'pro-forma']:
             return JsonResponse({'error': 'Invalid mode'}, status=400)
-        
         hash_val = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
-        
         try:
             snap = Snapshot.objects.get(hash=hash_val)
             logger.info(f"Reusing existing snapshot with ID {snap.id} for hash {hash_val}")
@@ -178,7 +146,7 @@ def lock_snapshot(request):
                 timestamp=ts,
                 params_json=json.dumps(params),
                 mode=mode,
-                user=request.jwt_payload.get('user', 'anonymous') if hasattr(request, 'jwt_payload') else 'anonymous'
+                user='anonymous'
             )
             logger.info(f"Created new snapshot with ID {snap.id} for hash {hash_val}")
             return JsonResponse({
@@ -200,7 +168,6 @@ def generate_csv_response(metrics, candidates):
         'Savings', 'ROE Uplift', 'Profit Margin', 'WACC'
     ]
     writer.writerow(headers)
-    
     for c in candidates:
         m = c['metrics']
         nav_data = m.get('nav', {})
@@ -209,7 +176,6 @@ def generate_csv_response(metrics, candidates):
         runway_data = m.get('runway', {})
         btc_data = m.get('btc_holdings', {})
         term_sheet = m.get('term_sheet', {})
-        
         writer.writerow([
             c['type'],
             f"{nav_data.get('avg_nav', 0):.2f}",
@@ -227,7 +193,6 @@ def generate_csv_response(metrics, candidates):
             f"{term_sheet.get('profit_margin', 0):.4f}",
             f"{m.get('wacc', 0):.4f}"
         ])
-    
     resp = HttpResponse(content_type='text/csv')
     resp['Content-Disposition'] = 'attachment; filename="metrics.csv"'
     resp.write(output.getvalue().encode('utf-8'))
@@ -241,7 +206,6 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
     elements = []
     elements.append(Paragraph(title, styles['Title']))
     elements.append(Spacer(1, 12))
-    
     for c in candidates:
         m = c['metrics']
         nav_data = m.get('nav', {})
@@ -250,7 +214,6 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
         runway_data = m.get('runway', {})
         btc_data = m.get('btc_holdings', {})
         term_sheet = m.get('term_sheet', {})
-        
         data = [
             ['Metric', 'Value'],
             ['Candidate', c['type']],
@@ -277,7 +240,6 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
         ]))
         elements.append(table)
         elements.append(Spacer(1, 12))
-    
     doc.build(elements)
     pdf = buffer.getvalue()
     buffer.close()
@@ -286,17 +248,16 @@ def generate_pdf_response(metrics, candidates, title="Financial Metrics Report")
     resp.write(pdf)
     return resp
 
-def run_calculation(data, snapshot_id):
-    from risk_calculator.config import DEFAULT_PARAMS  # Import here to avoid circular import
+from risk_calculator.utils.simulation import simulate_btc_paths
+from risk_calculator.utils.optimization import optimize_for_corporate_treasury
+from risk_calculator.utils.metrics import calculate_metrics, evaluate_candidate
 
+def run_calculation(data, snapshot_id):
     try:
         logger.info(f"Running calculation for snapshot {snapshot_id}")
         snapshot = Snapshot.objects.get(id=snapshot_id)
-        
-        # === CRITICAL FIX: MERGE DEFAULTS ===
         params = json.loads(snapshot.params_json)
-        params = {**DEFAULT_PARAMS, **params}  # ← THIS LINE FIXES 'nsga_pop_size' ERROR
-
+        params = {**DEFAULT_PARAMS, **params}
         params['export_format'] = data.get('format', 'json').lower()
         params['use_live'] = data.get('use_live', False)
         params['mode'] = snapshot.mode
@@ -306,9 +267,7 @@ def run_calculation(data, snapshot_id):
         calculation_seed = data.get('seed', 42)
         obj_switches = data.get('objective_switches', DEFAULT_PARAMS['objective_switches'])
         params['objective_switches'] = obj_switches
-
         params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
-
         validate_inputs(params)
 
         if params['use_live']:
@@ -332,6 +291,7 @@ def run_calculation(data, snapshot_id):
 
         def evaluate_candidate_wrapper(cand):
             temp_params = params.copy()
+            temp_params['structure'] = cand['params'].get('structure', temp_params.get('structure', 'Loan'))
             temp_params.update(cand['params'])
             return {
                 'type': cand['type'],
@@ -345,6 +305,7 @@ def run_calculation(data, snapshot_id):
         balanced = next((c for c in candidates if c['type'] == 'Balanced'), candidates[0])
         stable_params = params.copy()
         stable_params.update(balanced['params'])
+        stable_params['structure'] = balanced['params'].get('structure', stable_params.get('structure', 'Loan'))
 
         metrics_cache_key = f"metrics_{cache_key}"
         cached_metrics = cache.get(metrics_cache_key)
@@ -353,12 +314,6 @@ def run_calculation(data, snapshot_id):
         else:
             final_metrics = calculate_metrics(stable_params, btc_prices, vol_heston, seed=calculation_seed)
             cache.set(metrics_cache_key, final_metrics, timeout=3600)
-
-        nav_paths = np.array(final_metrics.get('nav', {}).get('nav_paths_preview', []))
-        if nav_paths.size > 0:
-            est_se = np.std(nav_paths) / max(1, np.sqrt(min(len(nav_paths), params['paths'])))
-            if final_metrics['nav']['avg_nav'] != 0 and est_se > 0.01 * abs(final_metrics['nav']['avg_nav']):
-                final_metrics['mc_warning'] = 'High variance; consider more paths or keep VR on.'
 
         payload = {
             'metrics': final_metrics,
@@ -374,7 +329,6 @@ def run_calculation(data, snapshot_id):
         elif params['export_format'] == 'pdf':
             return generate_pdf_response(final_metrics, candidate_results)
         return payload
-
     except Exception as e:
         logger.error(f"Calculation error: {e}\n{traceback.format_exc()}")
         return {'error': str(e)}
@@ -418,7 +372,7 @@ def what_if(request):
             return JsonResponse({'error': 'Snapshot ID, param, and value required'}, status=400)
         snapshot = Snapshot.objects.get(id=snapshot_id)
         params = json.loads(snapshot.params_json)
-        params = {**DEFAULT_PARAMS, **params}  # Merge defaults
+        params = {**DEFAULT_PARAMS, **params}
         params['export_format'] = data.get('format', 'json').lower()
         params['use_live'] = data.get('use_live', False)
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
@@ -427,9 +381,7 @@ def what_if(request):
         calculation_seed = data.get('seed', 42)
         obj_switches = data.get('objective_switches', DEFAULT_PARAMS['objective_switches'])
         params['objective_switches'] = obj_switches
-
         params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
-
         validate_inputs(params)
 
         if params['use_live']:
@@ -452,6 +404,7 @@ def what_if(request):
             if opts:
                 balanced = next((c for c in opts if c['type'] == 'Balanced'), opts[0])
                 params.update(balanced['params'])
+                params['structure'] = balanced['params'].get('structure', params.get('structure', 'Loan'))
         else:
             params[param] = float(value)
 
@@ -475,14 +428,13 @@ def reproduce_run(request):
         seed = int(data.get('seed', 42))
         snapshot = Snapshot.objects.get(id=snapshot_id)
         params = json.loads(snapshot.params_json)
-        params = {**DEFAULT_PARAMS, **params}  # Merge defaults
+        params = {**DEFAULT_PARAMS, **params}
         params['export_format'] = data.get('format', 'json').lower()
         params['use_variance_reduction'] = data.get('use_variance_reduction', DEFAULT_PARAMS['use_variance_reduction'])
         params['bootstrap_samples'] = data.get('bootstrap_samples', DEFAULT_PARAMS['bootstrap_samples'])
         params['paths'] = data.get('paths', DEFAULT_PARAMS['paths'])
         obj_switches = data.get('objective_switches', DEFAULT_PARAMS['objective_switches'])
         params['objective_switches'] = obj_switches
-
         params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
 
         cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{seed}"
@@ -515,7 +467,6 @@ def get_audit_trail(request):
     try:
         snapshots = Snapshot.objects.all().order_by('-timestamp')
         audit_entries = []
-        
         for snapshot in snapshots:
             entry = {
                 'timestamp': snapshot.timestamp.isoformat(),
@@ -529,14 +480,13 @@ def get_audit_trail(request):
                 'changes': []
             }
             audit_entries.append(entry)
-        
+
         if len(audit_entries) > 1:
             for i in range(len(audit_entries) - 1):
                 current = audit_entries[i]['assumptions']
                 previous = audit_entries[i + 1]['assumptions']
                 changes = []
                 all_keys = set(current.keys()) | set(previous.keys())
-                
                 for key in all_keys:
                     current_val = current.get(key)
                     previous_val = previous.get(key)
@@ -546,15 +496,13 @@ def get_audit_trail(request):
                             'from': previous_val,
                             'to': current_val
                         })
-                
                 audit_entries[i]['changes'] = changes
                 audit_entries[i]['action'] = f'Modified {len(changes)} parameters'
-        
+
         if audit_entries:
             audit_entries[-1]['action'] = 'Initial calculation'
-        
+
         return JsonResponse({'audit_trail': audit_entries})
-        
     except Exception as e:
         logger.error(f"Audit trail error: {e}\n{traceback.format_exc()}")
         return JsonResponse({'error': str(e)}, status=500)

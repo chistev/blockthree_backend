@@ -5,15 +5,13 @@ from typing import Dict, Any
 
 try:
     from django.core.cache import cache
-except ImportError:  # pragma: no cover
+except ImportError:
     cache = None
 
 logger = logging.getLogger(__name__)
 
-# ----------------------------- Utilities ------------------------------------ #
 
 def _bs_put_price(S, K, r, q, sigma, tau):
-    """Black–Scholes European put (no dividends if q=0)."""
     if tau <= 0 or sigma <= 0:
         return max(K - S, 0.0)
     sqrt_tau = np.sqrt(tau)
@@ -21,21 +19,8 @@ def _bs_put_price(S, K, r, q, sigma, tau):
     d2 = d1 - sigma * sqrt_tau
     return float(K * np.exp(-r * tau) * norm.cdf(-d2) - S * np.exp(-q * tau) * norm.cdf(-d1))
 
-def tsiveriotis_fernandes_convertible(
-    S: float,
-    K: float,
-    r: float,
-    q: float,
-    sigma: float,
-    T: float,
-    face: float,
-    coupon_rate: float,
-    credit_spread: float,
-    steps: int = 100
-) -> float:
-    """
-    Simplified Tsiveriotis–Fernandes-style split using a binomial lattice.
-    """
+
+def tsiveriotis_fernandes_convertible(S, K, r, q, sigma, T, face, coupon_rate, credit_spread, steps=100):
     if T <= 0:
         return max(face, S - K)
     dt = T / steps
@@ -61,58 +46,75 @@ def tsiveriotis_fernandes_convertible(
             eqty[i, j] = max(eqty[i, j], conv_now)
     return float(bond[0, 0] + eqty[0, 0])
 
+
 def almgren_chriss_slippage(Q: float, ADV: float, H: float, eta: float = 0.10, lambda_param: float = 0.01, sigma: float = 0.55) -> float:
-    """
-    Minimal Almgren–Chriss style slippage estimate as fraction of price.
-    """
     if ADV <= 0:
         return 0.0
     permanent = eta * (Q / (ADV + 1e-9))
     temporary = lambda_param * sigma * np.sqrt(max(H, 0.0))
     return float(max(permanent + temporary, 0.0))
 
-# ------------------------- Core Public API ---------------------------------- #
 
 def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray, seed: int = 42) -> Dict[str, Any]:
-    """
-    Evaluates a candidate financing structure, wrapping calculate_metrics.
-    """
     rng = np.random.default_rng(seed)
     tmp = dict(params)
     ctype = candidate.get("type")
     cpar = candidate.get("params", {})
-    # Map candidate parameters
+
     from risk_calculator.config import DEFAULT_PARAMS
-    tmp['LoanPrincipal'] = cpar.get('amount', tmp.get('LoanPrincipal', DEFAULT_PARAMS['LoanPrincipal'])) if tmp.get('structure') in ['Loan', 'Convertible'] else 0.0
-    tmp['new_equity_raised'] = cpar.get('amount', tmp.get('new_equity_raised', DEFAULT_PARAMS['new_equity_raised'])) if tmp.get('structure') in ['PIPE', 'ATM'] else 0.0
+
+    # Set structure from candidate
+    tmp['structure'] = cpar.get('structure', tmp.get('structure', 'Loan'))
+
+    # Set amounts
+    tmp['LoanPrincipal'] = cpar.get('amount', tmp.get('LoanPrincipal', DEFAULT_PARAMS['LoanPrincipal'])) if 'Loan' in tmp['structure'] or 'Convertible' in tmp['structure'] else 0.0
+    tmp['new_equity_raised'] = cpar.get('amount', tmp.get('new_equity_raised', DEFAULT_PARAMS['new_equity_raised'])) if tmp['structure'] in ['PIPE', 'ATM'] else 0.0
+
+    # Set rates
     tmp['cost_of_debt'] = cpar.get('rate', tmp.get('cost_of_debt', DEFAULT_PARAMS['cost_of_debt']))
-    tmp['pipe_discount'] = cpar.get('rate', tmp.get('pipe_discount', DEFAULT_PARAMS['pipe_discount'])) if tmp.get('structure') in ['PIPE', 'ATM'] else 0.0
+    tmp['pipe_discount'] = cpar.get('rate', tmp.get('pipe_discount', DEFAULT_PARAMS['pipe_discount'])) if tmp['structure'] in ['PIPE', 'ATM'] else 0.0
     tmp['LTV_Cap'] = cpar.get('ltv_cap', tmp.get('LTV_Cap', DEFAULT_PARAMS['LTV_Cap']))
     tmp['hedge_intensity'] = cpar.get('hedge_intensity', tmp.get('hedge_intensity', 0.0))
     tmp['premium'] = cpar.get('premium', tmp.get('premium', 0.3))
-    if ctype in ("Defensive", "Balanced", "Growth"):
-        ctype = cpar.get("structure", ctype)
+
     slippage = 0.0
-    if '+' in ctype:  # Hybrid
-        # For hybrid, assume blended proceeds
-        tmp['proceeds'] = tmp.get('LoanPrincipal', 0) + tmp.get('new_equity_raised', 0)
+    if '+' in ctype:
+        # Hybrid
+        loan_part = tmp.get('LoanPrincipal', 0.0)
+        equity_part = tmp.get('new_equity_raised', 0.0)
+        loan_proceeds = loan_part * (1 - tmp.get('fees_oid', 0.01))
+        if 'ATM' in tmp['structure']:
+            Q = equity_part
+            H = params.get("t", 1.0) * 12.0
+            slippage = almgren_chriss_slippage(Q, params.get("adv_30d", 1e6), H)
+            equity_proceeds = Q * (1 - tmp.get('pipe_discount', 0.0) - tmp.get('fees_ecm', 0.01) - slippage)
+        elif 'PIPE' in tmp['structure']:
+            equity_proceeds = equity_part * (1 - tmp.get('pipe_discount', 0.0) - tmp.get('fees_ecm', 0.01))
+        else:
+            equity_proceeds = 0.0
+        tmp['proceeds'] = loan_proceeds + equity_proceeds
     elif ctype == "ATM":
-        tmp["capacity"] = params["atm_pct_adv"] * params["adv_30d"]
-        Q = tmp["capacity"]
+        Q = tmp["new_equity_raised"]
         H = params.get("t", 1.0) * 12.0
-        slippage = almgren_chriss_slippage(Q, params["adv_30d"], H)
-        tmp["proceeds"] = Q * (1 - params["pipe_discount"] - params["fees_ecm"] - slippage)
-        tmp["new_equity_raised"] = tmp["proceeds"]
+        slippage = almgren_chriss_slippage(Q, params.get("adv_30d", 1e6), H)
+        tmp["proceeds"] = Q * (1 - tmp.get('pipe_discount', 0.0) - tmp.get('fees_ecm', 0.01) - slippage)
     elif ctype == "PIPE":
-        tmp["proceeds"] = params["new_equity_raised"] * (1 - params["pipe_discount"] - params["fees_ecm"])
+        tmp["proceeds"] = tmp["new_equity_raised"] * (1 - tmp.get('pipe_discount', 0.0) - tmp.get('fees_ecm', 0.01))
     elif ctype == "Convertible":
         tmp["premium"] = cpar.get("premium", 0.30)
-        tmp["proceeds"] = params["LoanPrincipal"] * (1 - params["fees_oid"])
+        tmp["proceeds"] = tmp["LoanPrincipal"] * (1 - tmp.get('fees_oid', 0.01))
     elif ctype == "Loan":
-        tmp["proceeds"] = params["LoanPrincipal"] * (1 - params["fees_oid"])
+        tmp["proceeds"] = tmp["LoanPrincipal"] * (1 - tmp.get('fees_oid', 0.01))
+    else:
+        tmp["proceeds"] = tmp.get('LoanPrincipal', 0) + tmp.get('new_equity_raised', 0)
+
+    price = max(tmp['BTC_current_market_price'], 1e-9)
+    tmp['BTC_purchased'] = tmp['proceeds'] / price
+
     m = calculate_metrics(tmp, btc_prices, vol_heston, seed=seed)
+
     ltv_term = np.asarray(m["ltv"].get("ltv_paths", []), dtype=float)
-    ltv_cap = float(tmp["LTV_Cap"])
+    ltv_cap = float(tmp.get("LTV_Cap", 0.0))
     over = ltv_term[ltv_term > ltv_cap]
     breach_depth = float(np.mean(over - ltv_cap)) if over.size else 0.0
     m['breach_depth'] = breach_depth
@@ -120,19 +122,16 @@ def evaluate_candidate(params: Dict[str, Any], candidate: Dict[str, Any], btc_pr
     m['cvar'] = float(cvar_val) if cvar_val is not None else None
     if ctype == "ATM":
         m['term_sheet']['slippage'] = slippage
+
     return m
 
+
 def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston: np.ndarray, seed: int = 42) -> Dict[str, Any]:
-    """
-    Path-wise treasury analytics over simulated BTC paths.
-    Robust to zeros/inactive features.
-    """
     rng = np.random.default_rng(seed)
     N, T = btc_prices.shape
     if N == 0 or T == 0:
         raise ValueError("btc_prices must be a non-empty (N, T) array")
 
-    # === INPUTS ===
     structure = params.get('structure', 'Loan')
     is_hybrid = '+' in structure
     loan_prin = float(params.get('LoanPrincipal', 0.0))
@@ -145,17 +144,13 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     capex_sched = np.array(params.get("capex_schedule", [0.0] * int(T)), dtype=float)
     if capex_sched.size < T:
         capex_sched = np.pad(capex_sched, (0, T - capex_sched.size), constant_values=0.0)
-
     h0 = float(params["haircut_h0"])
     alpha = float(params["haircut_alpha"])
     ltv_cap = float(params["LTV_Cap"]) if has_loan else 0.0
     liq_penalty = float(params["liquidation_penalty_bps"]) / 10000.0
-
-    iv = float(params.get("manual_iv", 0.55))  # No live fetch
-
+    iv = float(params.get("manual_iv", 0.55))
     tau_step = float(params.get("t", 1.0)) / max(T, 1)
 
-    # === STATE ARRAYS ===
     cash = np.zeros((N, T), dtype=float)
     cash[:, 0] = initial_cash
     nav = np.zeros((N, T), dtype=float)
@@ -168,33 +163,26 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     other_liabs = 0.0
     nols_remaining = np.full(N, float(params.get("nols", 0.0)), dtype=float)
 
-    # === STRESSED BURN RATE ===
     opex_stress_vol = float(params.get("opex_stress_volatility", 0.35))
     btc_current = float(params["BTC_current_market_price"])
     btc_relative = btc_prices / max(btc_current, 1e-9)
-
     bear_market = btc_relative < 0.7
     bull_market = btc_relative > 1.3
-
     random_shock = np.exp(rng.normal(0, opex_stress_vol, size=(N, T)))
     stress_multiplier = np.where(bear_market, 1.6, np.where(bull_market, 0.9, 1.0))
     stressed_burn = base_monthly_burn * random_shock * stress_multiplier
     stressed_burn = np.clip(stressed_burn, base_monthly_burn * 0.5, base_monthly_burn * 3.0)
 
-    # === SIMULATION LOOP ===
     for t_idx in range(1, T):
         S_t = btc_prices[:, t_idx]
         v_btc = total_btc * S_t
         vol_t = vol_heston[:, min(t_idx - 1, vol_heston.shape[1] - 1)]
         haircut_t = np.clip(h0 + alpha * vol_t, 0.05, 0.30) if has_loan else np.zeros_like(vol_t)
         collateral = v_btc * (1.0 - haircut_t) if has_loan else v_btc
-
         with np.errstate(divide="ignore", invalid="ignore"):
             ltv_t = np.where(collateral > 0, loan_prin / collateral, 0.0) if has_loan else np.zeros(N)
-
         if t_idx == T - 1:
             ltv_term[...] = ltv_t
-
         breaches = ltv_t > ltv_cap if has_loan else np.zeros(N, dtype=bool)
         breach_counts += breaches.astype(float)
         idxs = np.where(breaches)[0]
@@ -210,37 +198,25 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         capex = capex_sched[t_idx] if t_idx < capex_sched.size else 0.0
         hedge_cost = 0.0
         hedge_gain = 0.0
-
         if params.get("hedge_policy", "none") == "protective_put" and params['hedge_intensity'] > 0:
             hedge_frac = float(params.get("hedge_intensity", 0.0))
             K = S_t * (1.0 - hedge_frac)
             S_mid = float(np.mean(S_t))
-            put_unit = _bs_put_price(
-                S_mid,
-                float(np.mean(K)),
-                float(params["risk_free_rate"]),
-                float(params.get("delta", 0.0)),
-                iv,
-                tau_step
-            )
+            put_unit = _bs_put_price(S_mid, float(np.mean(K)), float(params["risk_free_rate"]), float(params.get("delta", 0.0)), iv, tau_step)
             hedge_cost = hedge_frac * put_unit * total_btc
             S_next = btc_prices[:, min(t_idx + 1, T - 1)]
             payoff = np.maximum(K - S_next, 0.0)
             hedge_gain = hedge_frac * payoff * total_btc
         hedge_pnl[:, t_idx] = hedge_gain - hedge_cost
-
         burn_today = stressed_burn[:, t_idx] if t_idx < T else base_monthly_burn
         cash_delta = -burn_today - capex - interest - hedge_cost + hedge_gain
         cash[:, t_idx] = cash[:, t_idx - 1] + cash_delta
-
         taxable = np.maximum(0.0, hedge_gain - nols_remaining)
         tax = taxable * float(params["tax_rate"])
         cash[:, t_idx] -= tax
         nols_remaining = np.maximum(0.0, nols_remaining - hedge_gain)
-
         nav[:, t_idx] = cash[:, t_idx] + v_btc + other_assets - (loan_prin + other_liabs)
 
-    # === RUNWAY ===
     runway = np.full(N, T, dtype=float)
     for i in range(N):
         neg = np.where(cash[i] < 0.0)[0]
@@ -305,14 +281,14 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     beta = float(params["beta_ROE"])
     exp_btc = float(params["expected_return_btc"])
     roe_base = rf + beta * (exp_btc - rf)
-    roe_base = np.clip(roe_base, -3.0, 5.0)  # Clamp
+    roe_base = np.clip(roe_base, -3.0, 5.0)
     leverage = loan_prin / max(float(params["initial_equity_value"] + eq_raised), 1e-9) if has_loan else 0.0
     roe = roe_base * (1.0 + leverage * (1.0 - float(np.mean(dil_paths))))
-    roe = np.clip(roe, -1.0, 10.0)  # Never < -100% unless true insolvency
+    roe = np.clip(roe, -1.0, 10.0)
     avg_roe = float(np.mean(roe))
     ci_roe = 0.0
     sharpe = float((avg_roe - rf) / max(np.std([roe], ddof=1), 1e-9) if False else max(1e-9, 0.01))
-    sharpe = np.clip(sharpe, -3.0, 5.0)  # Clamp for display
+    sharpe = np.clip(sharpe, -3.0, 5.0)
 
     scenarios = {
         "Bull Case": {"price_multiplier": 1.5, "probability": 0.25},
@@ -368,14 +344,12 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
     realized_dil_dollars = float(np.mean(dil_paths)) * float(params["initial_equity_value"])
     savings = float(base_dil_dollars - realized_dil_dollars)
 
-    # WACC
     E = float(params["initial_equity_value"] + eq_raised)
     D = loan_prin
     V = max(E + D, 1e-9)
-    r_e = exp_btc  # Equity cost ~ expected BTC return
+    r_e = exp_btc
     r_d = cost_of_debt
     tax_rate = float(params["tax_rate"])
-    # adj_BTC: haircut-adjusted collateral cost ~ avg haircut * r_d
     avg_haircut = float(np.mean(h0 + alpha * vol_heston)) if vol_heston.size else 0.0
     adj_BTC = params['kappa_btc'] * avg_haircut * r_d
     wacc = (E / V) * r_e + (D / V) * r_d * (1 - tax_rate) + adj_BTC
@@ -456,7 +430,6 @@ def calculate_metrics(params: Dict[str, Any], btc_prices: np.ndarray, vol_heston
         "wacc": float(wacc),
     }
 
-    # Remove NaN/Inf
     for k, v in result.items():
         if isinstance(v, dict):
             for sk, sv in v.items():

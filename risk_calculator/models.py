@@ -1,5 +1,6 @@
 from django.db import models
 
+
 class Snapshot(models.Model):
     hash = models.CharField(max_length=64, unique=True)
     timestamp = models.DateTimeField()
@@ -13,6 +14,7 @@ class Snapshot(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=['hash', 'timestamp'])]
+
 
 class PasswordAccess(models.Model):
     password = models.CharField(max_length=128, unique=True)
