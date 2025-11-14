@@ -21,7 +21,6 @@ from concurrent.futures import ThreadPoolExecutor
 import jwt
 import datetime
 import traceback
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
@@ -269,14 +268,12 @@ def run_calculation(data, snapshot_id):
         params['objective_switches'] = obj_switches
         params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
         validate_inputs(params)
-
         if params['use_live']:
             btc_price = fetch_btc_price_cached()
             if btc_price:
                 params['BTC_current_market_price'] = btc_price
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
-
         cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{calculation_seed}"
         cached_simulation = cache.get(cache_key)
         if cached_simulation:
@@ -284,11 +281,9 @@ def run_calculation(data, snapshot_id):
         else:
             btc_prices, vol_heston = simulate_btc_paths(params, seed=calculation_seed)
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
-
         candidates = optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed=calculation_seed)
         if not candidates or len(candidates) < 4:
             raise ValueError("Optimization failed to produce candidates")
-
         def evaluate_candidate_wrapper(cand):
             temp_params = params.copy()
             temp_params['structure'] = cand['params'].get('structure', temp_params.get('structure', 'Loan'))
@@ -298,15 +293,12 @@ def run_calculation(data, snapshot_id):
                 'params': cand['params'],
                 'metrics': evaluate_candidate(temp_params, cand, btc_prices, vol_heston, seed=calculation_seed)
             }
-
         with ThreadPoolExecutor(max_workers=4) as executor:
             candidate_results = list(executor.map(evaluate_candidate_wrapper, candidates))
-
         balanced = next((c for c in candidates if c['type'] == 'Balanced'), candidates[0])
         stable_params = params.copy()
         stable_params.update(balanced['params'])
         stable_params['structure'] = balanced['params'].get('structure', stable_params.get('structure', 'Loan'))
-
         metrics_cache_key = f"metrics_{cache_key}"
         cached_metrics = cache.get(metrics_cache_key)
         if cached_metrics:
@@ -314,7 +306,6 @@ def run_calculation(data, snapshot_id):
         else:
             final_metrics = calculate_metrics(stable_params, btc_prices, vol_heston, seed=calculation_seed)
             cache.set(metrics_cache_key, final_metrics, timeout=3600)
-
         payload = {
             'metrics': final_metrics,
             'candidates': candidate_results,
@@ -323,7 +314,6 @@ def run_calculation(data, snapshot_id):
             'timestamp': snapshot.timestamp.isoformat(),
             'mode': snapshot.mode
         }
-
         if params['export_format'] == 'csv':
             return generate_csv_response(final_metrics, candidate_results)
         elif params['export_format'] == 'pdf':
@@ -383,14 +373,12 @@ def what_if(request):
         params['objective_switches'] = obj_switches
         params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
         validate_inputs(params)
-
         if params['use_live']:
             btc_price = fetch_btc_price_cached()
             if btc_price:
                 params['BTC_current_market_price'] = btc_price
                 if params['targetBTCPrice'] == DEFAULT_PARAMS['targetBTCPrice']:
                     params['targetBTCPrice'] = btc_price
-
         cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{calculation_seed}"
         cached_simulation = cache.get(cache_key)
         if cached_simulation:
@@ -398,7 +386,6 @@ def what_if(request):
         else:
             btc_prices, vol_heston = simulate_btc_paths(params, seed=calculation_seed)
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
-
         if value in ['optimize', 'maximize'] or param == 'optimize_all':
             opts = optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed=calculation_seed)
             if opts:
@@ -407,9 +394,7 @@ def what_if(request):
                 params['structure'] = balanced['params'].get('structure', params.get('structure', 'Loan'))
         else:
             params[param] = float(value)
-
         final_data = calculate_metrics(params, btc_prices, vol_heston, seed=calculation_seed)
-
         if params['export_format'] == 'csv':
             return generate_csv_response(final_data, [{'type': 'What-If', 'params': final_data['term_sheet'], 'metrics': final_data}])
         elif params['export_format'] == 'pdf':
@@ -436,7 +421,6 @@ def reproduce_run(request):
         obj_switches = data.get('objective_switches', DEFAULT_PARAMS['objective_switches'])
         params['objective_switches'] = obj_switches
         params['manual_iv'] = float(params.get('manual_iv', DEFAULT_PARAMS['manual_iv']))
-
         cache_key = f"simulation_{hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()}_{seed}"
         cached_simulation = cache.get(cache_key)
         if cached_simulation:
@@ -444,7 +428,6 @@ def reproduce_run(request):
         else:
             btc_prices, vol_heston = simulate_btc_paths(params, seed=seed)
             cache.set(cache_key, (btc_prices, vol_heston), timeout=3600)
-
         metrics = calculate_metrics(params, btc_prices, vol_heston, seed=seed)
         resp = {
             'metrics': metrics,
@@ -480,7 +463,6 @@ def get_audit_trail(request):
                 'changes': []
             }
             audit_entries.append(entry)
-
         if len(audit_entries) > 1:
             for i in range(len(audit_entries) - 1):
                 current = audit_entries[i]['assumptions']
@@ -498,10 +480,8 @@ def get_audit_trail(request):
                         })
                 audit_entries[i]['changes'] = changes
                 audit_entries[i]['action'] = f'Modified {len(changes)} parameters'
-
         if audit_entries:
             audit_entries[-1]['action'] = 'Initial calculation'
-
         return JsonResponse({'audit_trail': audit_entries})
     except Exception as e:
         logger.error(f"Audit trail error: {e}\n{traceback.format_exc()}")

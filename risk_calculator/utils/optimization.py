@@ -6,9 +6,7 @@ from pymoo.util.ref_dirs import get_reference_directions
 from pymoo.optimize import minimize as pymoo_minimize
 from risk_calculator.utils.metrics import calculate_metrics, evaluate_candidate
 from risk_calculator.utils.metrics import almgren_chriss_slippage
-
 logger = logging.getLogger(__name__)
-
 
 def _ensure_2d(arr):
     arr = np.asarray(arr)
@@ -16,13 +14,12 @@ def _ensure_2d(arr):
         return arr.reshape(1, -1)
     return arr
 
-
 def _mk_params(X_row, params, structure):
     amount = float(X_row[0])
     price = max(params['BTC_current_market_price'], 1e-9)
     btc_bought = amount / price
     p = {
-        'structure': structure,  # ← CRITICAL FIX
+        'structure': structure,
         'amount': amount,
         'btc_bought': btc_bought,
         'rate': float(X_row[1]),
@@ -39,7 +36,6 @@ def _mk_params(X_row, params, structure):
         p['LoanPrincipal'] = amount
         p['new_equity_raised'] = 0.0
     return p
-
 
 class TreasuryProblem(ElementwiseProblem):
     def __init__(self, params, btc_prices, vol_heston, seed: int = 42):
@@ -109,11 +105,26 @@ class TreasuryProblem(ElementwiseProblem):
         if self.structure in ['PIPE', 'ATM']:
             p['new_equity_raised'] = amount
             p['LoanPrincipal'] = 0.0
-        else:
+            p['pipe_discount'] = p['rate']
+            if self.structure == 'ATM':
+                Q = amount
+                H = p.get("t", 1.0) * 12.0
+                slippage = almgren_chriss_slippage(Q, p.get("adv_30d", 1e6), H)
+                p['proceeds'] = Q * (1 - p.get('pipe_discount', 0.0) - p.get('fees_ecm', 0.01) - slippage)
+            else:
+                p['proceeds'] = amount * (1 - p.get('pipe_discount', 0.0) - p.get('fees_ecm', 0.01))
+        elif self.structure == 'Convertible':
             p['LoanPrincipal'] = amount
             p['new_equity_raised'] = 0.0
+            p['cost_of_debt'] = p['rate']
+            p['proceeds'] = amount * (1 - p.get('fees_oid', 0.01))
+        else:  # Loan
+            p['LoanPrincipal'] = amount
+            p['new_equity_raised'] = 0.0
+            p['cost_of_debt'] = p['rate']
+            p['proceeds'] = amount * (1 - p.get('fees_oid', 0.01))
         price = max(p['BTC_current_market_price'], 1e-9)
-        p['BTC_purchased'] = amount / price
+        p['BTC_purchased'] = max(0, p['proceeds'] / price)
         try:
             m = calculate_metrics(p, self.btc_prices, self.vol_heston, seed=self.seed)
             penalty = self._check_constraints(p, m)
@@ -131,10 +142,9 @@ class TreasuryProblem(ElementwiseProblem):
             logger.debug(f"Eval failed: {e}")
             out['F'] = [1e9] * self.n_obj
 
-
 def optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed: int = 42):
     logger.info("Starting NSGA-III optimizer")
-    structures = ['ATM', 'PIPE', 'Loan']
+    structures = ['ATM', 'PIPE', 'Loan', 'Convertible']
     all_reps = {}
     for structure in structures:
         p = params.copy()
@@ -143,39 +153,27 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed: int = 
         ref_dirs = get_reference_directions("das-dennis", problem.n_obj, n_partitions=6)
         algorithm = NSGA3(ref_dirs=ref_dirs, pop_size=params.get('nsga_pop_size', 32))
         res = pymoo_minimize(problem, algorithm, ('n_gen', params.get('nsga_n_gen', 25)), seed=seed, verbose=False)
-
         if res.X is None or res.F is None or len(res.X) == 0:
             logger.warning(f"No valid solutions for {structure}, using fallback")
             base = p.get('LoanPrincipal', p.get('new_equity_raised', 25_000_000))
             fallbacks = [
-                ('Defensive', _mk_params(np.array([base*0.6, 0.05, 0.40, 0.10, 0.30]), p, structure)),
                 ('Balanced', _mk_params(np.array([base*1.0, 0.06, 0.50, 0.15, 0.30]), p, structure)),
-                ('Growth', _mk_params(np.array([base*1.4, 0.07, 0.60, 0.20, 0.20]), p, structure)),
             ]
             all_reps[structure] = {typ: par for typ, par in fallbacks}
             continue
-
         X = _ensure_2d(res.X)
         F = _ensure_2d(res.F)
-        candidates = []
-        for i in range(min(3, len(X))):
-            par = _mk_params(X[i], p, structure)
-            candidates.append((f"Cand{i}", par))
-
-        labeled = []
-        if len(candidates) >= 3:
-            labeled = [
-                ('Defensive', candidates[0][1]),
-                ('Balanced', candidates[1][1]),
-                ('Growth', candidates[2][1]),
-            ]
-        else:
-            labeled = [(f"Cand{i}", par) for i, (_, par) in enumerate(candidates)]
-        all_reps[structure] = {typ: par for typ, par in labeled}
-
+        # Sort by amount (first variable)
+        sort_indices = np.argsort(X[:, 0])
+        X = X[sort_indices]
+        F = F[sort_indices]
+        # Take the middle one for Balanced
+        mid_idx = len(X) // 2
+        par = _mk_params(X[mid_idx], p, structure)
+        all_reps[structure] = {'Balanced': par}
     hybrid_optimal = None
     if params.get('enable_hybrid', False):
-        pairs = [('Loan', 'ATM'), ('Loan', 'PIPE')]
+        pairs = [('Loan', 'ATM'), ('Loan', 'PIPE'), ('Convertible', 'ATM'), ('Convertible', 'PIPE')]
         for s1, s2 in pairs:
             if s1 not in all_reps or s2 not in all_reps:
                 continue
@@ -191,18 +189,17 @@ def optimize_for_corporate_treasury(params, btc_prices, vol_heston, seed: int = 
                 'ltv_cap': max(c1['ltv_cap'], c2['ltv_cap']),
                 'hedge_intensity': (c1['hedge_intensity'] + c2['hedge_intensity']) / 2,
                 'premium': max(c1['premium'], c2['premium']),
-                'LoanPrincipal': c1['amount'] if s1 == 'Loan' else c2['amount'] if s2 == 'Loan' else 0,
+                'LoanPrincipal': c1['amount'] if s1 in ['Loan', 'Convertible'] else c2['amount'] if s2 in ['Loan', 'Convertible'] else 0,
                 'new_equity_raised': c1['amount'] if s1 in ['PIPE','ATM'] else c2['amount'] if s2 in ['PIPE','ATM'] else 0,
             }
             price = max(params['BTC_current_market_price'], 1e-9)
             blended['btc_bought'] = blended['amount'] / price
             hybrid_optimal = {'type': 'Hybrid', 'params': blended}
             break
-
     final = []
-    for reps in all_reps.values():
+    for structure, reps in all_reps.items():
         for typ, par in reps.items():
-            final.append({'type': typ, 'params': par})
+            final.append({'type': f"{structure} Balanced", 'params': par})
     if hybrid_optimal:
         final.append(hybrid_optimal)
     if not final:

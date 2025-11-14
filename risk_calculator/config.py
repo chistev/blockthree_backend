@@ -53,7 +53,6 @@ DEFAULT_PARAMS = {
     'use_variance_reduction': True,
     'bootstrap_samples': 100,
     'opex_stress_volatility': 0.35,
-
     # === NSGA-III & OBJECTIVES ===
     'objective_switches': {
         'max_btc': True,
@@ -65,19 +64,16 @@ DEFAULT_PARAMS = {
     },
     'nsga_pop_size': 32,
     'nsga_n_gen': 25,
-
     # === CONSTRAINT PENALTIES ===
     'lambda_dilution': 10.0,
     'lambda_runway': 10.0,
     'lambda_breach': 10.0,
     'lambda_wacc': 10.0,
     'lambda_profit_margin': 10.0,
-
     # === WACC & SOFT CONSTRAINTS ===
     'wacc_cap': 0.12,
     'min_profit_margin_constraint': 0.05,
     'kappa_btc': 0.3,
-
     # === HYBRID ===
     'enable_hybrid': True,
 }

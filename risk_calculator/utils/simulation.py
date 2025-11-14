@@ -4,10 +4,8 @@ import logging
 from multiprocessing import Pool, cpu_count, set_start_method
 import json
 import hashlib
-
 logger = logging.getLogger(__name__)
 set_start_method('spawn', force=True)
-
 
 def simulate_btc_paths_chunk(params, base_seed, start_idx, chunk_size, full_U):
     rng = np.random.default_rng(base_seed + start_idx)
@@ -16,7 +14,6 @@ def simulate_btc_paths_chunk(params, base_seed, start_idx, chunk_size, full_U):
         btc_prices = np.full((chunk_size, T), params['BTC_current_market_price'])
         vol_heston = np.full((chunk_size, max(1, T-1)), params['sigma']**2)
         return btc_prices, vol_heston
-
     dt = float(params['t']) / T
     mu_base = params['mu'] * 0.5
     mu_adj = 0.7 * mu_base + 0.3 * (np.log(params['targetBTCPrice'] / params['BTC_current_market_price']) / max(1e-9, float(params['t'])))
@@ -30,14 +27,12 @@ def simulate_btc_paths_chunk(params, base_seed, start_idx, chunk_size, full_U):
     xi = float(params['sigma']) * 0.10
     v0 = theta
     eps = 1e-6
-
     chunk_U = full_U[start_idx:start_idx + chunk_size]
     Z_diff = norm.ppf(np.clip(chunk_U[:, :2*(T-1)], 1e-9, 1-1e-9)) if T > 1 else np.empty((chunk_size, 0))
     Z_r = Z_diff[:, 0:(T-1)] if T > 1 else np.empty((chunk_size, 0))
     Z_v = Z_diff[:, (T-1):2*(T-1)] if T > 1 else np.empty((chunk_size, 0))
     U_jump = chunk_U[:, 2*(T-1):3*(T-1)] if T > 1 else np.empty((chunk_size, 0))
     Z_jump = norm.ppf(np.clip(chunk_U[:, 3*(T-1):], 1e-9, 1-1e-9)) if T > 1 else np.empty((chunk_size, 0))
-
     # Heston volatility
     if T == 1:
         vol_heston = np.full((chunk_size, 1), v0)
@@ -50,7 +45,6 @@ def simulate_btc_paths_chunk(params, base_seed, start_idx, chunk_size, full_U):
             shock = xi * np.sqrt(np.maximum(v_prev, eps)) * sqrt_dt * Z_v[:, idx]
             v[:, idx] = np.maximum(v_prev + kappa * (theta - v_prev) * dt + shock, 1e-4)
         vol_heston = v
-
     # Price paths
     prices = np.empty((chunk_size, T))
     prices[:, 0] = float(params['BTC_current_market_price'])
@@ -65,10 +59,8 @@ def simulate_btc_paths_chunk(params, base_seed, start_idx, chunk_size, full_U):
         prices[:, 1:] = prices[:, [0]] * np.exp(logS)
     else:
         prices[:, 0] = float(params['BTC_current_market_price'])
-
     vol_heston = vol_heston if T > 1 else np.full((chunk_size, 1), v0)
     return prices, vol_heston
-
 
 def simulate_btc_paths(params, seed=42):
     N = int(params['paths'])
@@ -80,26 +72,21 @@ def simulate_btc_paths(params, seed=42):
     if chunk_size < 100:
         num_processes = 1
         chunk_size = N
-
     logger.info(f"Using {num_processes} processes for {N} paths, chunk size {chunk_size}, hashed seed {base_seed}")
-
     d = 4 * (T - 1) if T > 1 else 4
     m = qmc.Sobol(d=d, scramble=True, seed=base_seed)
     half = (N + 1) // 2
     U = m.random(half)
     U_anti = 1.0 - U
     full_U = np.vstack([U, U_anti])[:N, :]
-
     args = [(params, base_seed, i * chunk_size, chunk_size, full_U) for i in range(num_processes)]
     if N % num_processes != 0:
         args[-1] = (params, base_seed, (num_processes-1) * chunk_size, N - (num_processes-1) * chunk_size, full_U)
-
     if num_processes > 1:
         with Pool(processes=num_processes) as pool:
             results = pool.starmap(simulate_btc_paths_chunk, args)
     else:
         results = [simulate_btc_paths_chunk(*args[0])]
-
     prices = np.vstack([res[0] for res in results])
     vol_heston = np.vstack([res[1] for res in results])
     logger.info(f"Simulated BTC mean terminal price: {float(np.mean(prices[:, -1])):.2f}")
